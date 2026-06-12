@@ -40,7 +40,9 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) ->
     ws.column_dimensions["B"].width = 60
 
     ws = wb.create_sheet("Ledger")
-    _sheet_of_lines(ws, [l for l in lines if l["status"] not in ("excluded",)])
+    # One row per real expense; matched vault twins live behind their card line.
+    _sheet_of_lines(ws, [l for l in lines if l["status"] != "excluded"
+                         and (l["source"] == "card_feed" or l.get("reimbursable"))])
 
     ws = wb.create_sheet("Gaps")
     ws.append(["Gap type", "Date", "Merchant / detail", "Amount", "Who"])

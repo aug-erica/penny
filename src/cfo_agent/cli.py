@@ -140,7 +140,10 @@ def cmd_close_run(args):
     lines = ledger.lines_for_month(conn, cfg.client, month)
     rec = _find_rec_report(cfg, m_end)
     g = gaps_mod.gaps_for_month(conn, cfg.client, month, rec)
-    active = [l for l in lines if l["status"] != "excluded"]
+    # One row per real expense: card charges + reimbursable vault expenses.
+    # (A vault line matched to a card line is the same expense seen twice.)
+    active = [l for l in lines if l["status"] != "excluded"
+              and (l["source"] == "card_feed" or l.get("reimbursable"))]
     summary = {
         "close month": month,
         "transactions": len(active),

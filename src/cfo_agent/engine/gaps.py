@@ -13,8 +13,11 @@ def gaps_for_month(conn, client: str, close_month: str, rec_report=None) -> dict
     no_receipt = [l for l in card if not l.get("matched_line_id") and not l.get("receipt_link")]
     orphan_vault = [l for l in vault
                     if not l.get("matched_line_id") and not _reimbursable(l)]
+    # Same target set as the categorizer: card charges + reimbursable vault
+    # expenses (a matched vault line is the same expense as its card twin).
     uncategorized = [l for l in lines
                      if l["status"] == "draft" and l["amount_cents"] > 0
+                     and (l["source"] == "card_feed" or l.get("reimbursable"))
                      and not l.get("proposed_coa_line")]
 
     out = {

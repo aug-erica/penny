@@ -40,3 +40,4 @@ billable:
   # Billable T&E is always flagged for review regardless of confidence:
   # it hits client invoices and the ~10% T&E cap per SOW.
   always_flag: true
+  billable_categories: ["Billable Expense"]

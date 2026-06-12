@@ -8,8 +8,12 @@ from . import rules as rules_mod
 
 
 def categorize_month(conn, cfg, close_month: str, use_llm: bool = True) -> dict:
+    """Targets: card-feed charges plus reimbursable vault expenses (personal-card
+    spend). Vault lines matched to a card line are the same expense seen twice —
+    the card line carries the proposal."""
     lines = [l for l in ledger.lines_for_month(conn, cfg.client, close_month)
-             if l["status"] == "draft" and l["amount_cents"] > 0]
+             if l["status"] == "draft" and l["amount_cents"] > 0
+             and (l["source"] == "card_feed" or l.get("reimbursable"))]
     stats = {"rule": 0, "history": 0, "llm": 0, "uncategorized": 0}
     leftovers = []
     for line in lines:
@@ -36,9 +40,12 @@ def categorize_month(conn, cfg, close_month: str, use_llm: bool = True) -> dict:
 
 
 def _apply(conn, cfg, line: dict, prop):
-    flag_billable = (cfg.section("billable").get("always_flag")
-                     and (prop.billable or line.get("truth_billable")))
+    bcfg = cfg.section("billable")
+    billable = prop.billable
+    if billable is None and prop.coa_line in (bcfg.get("billable_categories") or []):
+        billable = True
+    flag_billable = bcfg.get("always_flag") and billable
     status = "flagged" if (prop.confidence != "high" or flag_billable) else "draft"
     ledger.set_proposal(conn, line["id"], prop.coa_line, prop.proposed_by,
                         prop.confidence, prop.rationale,
-                        billable=prop.billable, status=status)
+                        billable=billable, status=status)

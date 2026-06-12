@@ -190,3 +190,13 @@ def history_for_merchant(conn, client: str, merchant_norm: str) -> list:
            GROUP BY coa_line ORDER BY n DESC""",
         (client, merchant_norm),
     )]
+
+
+def history_detail(conn, client: str, merchant_norm: str) -> list:
+    """Per-(coa_line, close_month) counts, newest month first."""
+    return [dict(r) for r in conn.execute(
+        """SELECT coa_line, close_month, n FROM merchant_history
+           WHERE client=? AND merchant_norm=?
+           ORDER BY close_month DESC, n DESC""",
+        (client, merchant_norm),
+    )]

@@ -22,6 +22,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import List
+from urllib.parse import quote
 
 import httpx
 
@@ -51,11 +52,16 @@ class ExpensifyExporter:
 
     # -- HTTP ----------------------------------------------------------------
     def _post(self, job: dict, template: str = None) -> bytes:
-        data = {"requestJobDescription": json.dumps(job)}
+        # Expensify decodes '+' literally instead of as a space, so standard
+        # form-encoding corrupts any value containing spaces (pretty-printed
+        # JSON, Freemarker templates). Build the body with explicit %-encoding.
+        body = "requestJobDescription=" + quote(
+            json.dumps(job, separators=(",", ":")), safe="")
         if template is not None:
-            data["template"] = template
+            body += "&template=" + quote(template, safe="")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
         for attempt in range(4):
-            resp = httpx.post(ENDPOINT, data=data, timeout=120)
+            resp = httpx.post(ENDPOINT, content=body, headers=headers, timeout=120)
             if resp.status_code == 429:
                 time.sleep(2 ** (attempt + 1))
                 continue
