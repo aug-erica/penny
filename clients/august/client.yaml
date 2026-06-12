@@ -1,0 +1,42 @@
+# August — client config. Everything client-specific lives in this folder;
+# the engine and adapters must stay client-agnostic (see Expensify-Agent-Spec Part 2).
+client: august
+entity: "August Public Inc"
+
+reviewer:
+  primary: "Purvi Patel"      # August-side approver and human-in-the-loop
+  secondary: "Erica Seldin"
+
+data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Shared drives/August Brain/06_Operations/CFO Agent"
+close_data_dir: "2026 Month End Close"   # relative to data_root
+runs_dir: "runs"                          # relative to data_root; review artifacts land here
+
+card_feed:
+  type: chase_statement_pdf
+  account_last4: "8303"
+  # Month folders are MMYY; statement covering the tail of month M lives in folder M+1.
+  month_folder_format: "%m%y"
+  statement_glob: "Bank & CC Statements and Recs/*8303*Statement*.pdf"
+  rec_report_glob: "Bank & CC Statements and Recs/*8303*Rec*Report*.pdf"
+
+receipt_vault:
+  type: expensify
+  # Date filters on the Expensify API apply to report submission date, not expense
+  # date — fetch this many days of padding either side of the close month and
+  # filter by expense date in code.
+  window_pad_days_before: 45
+  window_pad_days_after: 0   # 0 = through run date
+  report_states: ["APPROVED", "REIMBURSED", "ARCHIVED"]
+  shadow_report_states: ["SUBMITTED", "APPROVED", "REIMBURSED", "ARCHIVED"]
+
+books_out:
+  type: csv_stub   # Phase 1: nothing is ever posted
+
+matching:
+  date_window_days: 3
+  merchant_fuzz_threshold: 80
+
+billable:
+  # Billable T&E is always flagged for review regardless of confidence:
+  # it hits client invoices and the ~10% T&E cap per SOW.
+  always_flag: true

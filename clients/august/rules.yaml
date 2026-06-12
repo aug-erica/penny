@@ -1,0 +1,9 @@
+# Merchant -> COA rules. Seeded from Jan–Mar Expensify history (build step 7);
+# grows every close via the reviewer correction write-back loop.
+# Rule kinds: exact merchant_norm, substring keyword, cardholder default.
+merchant_rules: []
+#  - match: "ANTHROPIC"
+#    kind: substring
+#    coa_line: "8xxx-Software & Subscriptions"
+keyword_rules: []
+cardholder_defaults: {}

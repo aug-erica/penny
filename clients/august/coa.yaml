@@ -1,0 +1,22 @@
+# August chart-of-accounts target lines for expense categorization.
+# Codes observed in Skyfin working papers; the authoritative category list is
+# whatever Expensify's policy exposes — refresh this file from the first real
+# Expensify export (categories appear verbatim in the `category` field).
+coa_lines:
+  - "5030-Freelancer"
+  - "6050-Bonus"
+  - "6211-Board Member"
+  - "8535-General Travel"
+# GL roll-up buckets (2026 expense dashboard) — used for reporting rollups,
+# not as categorization targets:
+rollups:
+  - "Team Culture"
+  - "Professional Development"
+  - "Marketing"
+  - "G&A Expenses"
+  - "Consulting/Freelancers"
+  - "Recruiting & Relocation"
+  - "Bank & Other Fees"
+  - "Selling Expenses"
+  - "Non-billable Expenses"
+  - "Billable T&E"
