@@ -168,17 +168,39 @@ def set_status(conn, line_id: int, status: str):
 
 
 def rebuild_merchant_history(conn, client: str, through_month: str):
-    """Precedent index from receipt-vault truth categories, strictly for months
-    BEFORE through_month — keeps validation honest (no ground-truth leakage)."""
+    """Precedent index, strictly for months BEFORE through_month (keeps
+    validation honest — no ground-truth leakage).
+
+    Sources, in order of authority:
+    1. Reviewer-approved ledger decisions (status approved/posted) — the
+       agent's own correction loop. As closes run agent-first, this becomes
+       the only source.
+    2. Historical employee Expensify coding — bootstrap only, for months that
+       predate the agent. The dependency on employees coding expenses decays
+       as approved months accumulate; it must never grow.
+    Months with approved decisions contribute ONLY those (source 2 is skipped
+    for them), so the bootstrap can't dilute the reviewer's word."""
     conn.execute("DELETE FROM merchant_history WHERE client=?", (client,))
+    conn.execute(
+        """INSERT INTO merchant_history (client, merchant_norm, coa_line, close_month, n)
+           SELECT client, merchant_norm, proposed_coa_line, close_month, COUNT(*)
+           FROM ledger_lines
+           WHERE client=? AND status IN ('approved','posted')
+                 AND proposed_coa_line IS NOT NULL AND close_month < ?
+           GROUP BY merchant_norm, proposed_coa_line, close_month""",
+        (client, through_month),
+    )
     conn.execute(
         """INSERT INTO merchant_history (client, merchant_norm, coa_line, close_month, n)
            SELECT client, merchant_norm, truth_category, close_month, COUNT(*)
            FROM ledger_lines
            WHERE client=? AND source='receipt_vault' AND truth_category IS NOT NULL
-                 AND truth_category != '' AND close_month < ?
+                 AND truth_category NOT IN ('', 'Uncategorized') AND close_month < ?
+                 AND close_month NOT IN (
+                     SELECT DISTINCT close_month FROM ledger_lines
+                     WHERE client=? AND status IN ('approved','posted'))
            GROUP BY merchant_norm, truth_category, close_month""",
-        (client, through_month),
+        (client, through_month, client),
     )
     conn.commit()
 

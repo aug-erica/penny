@@ -21,6 +21,9 @@ LEDGER_COLS = [
     ("Amount", None, 11), ("Cardholder", "cardholder", 18),
     ("Employee", "employee", 24), ("Proposed COA", "proposed_coa_line", 26),
     ("Conf", "confidence", 8), ("By", "proposed_by", 8),
+    # Cross-check only, never a proposal source — goes away when employees
+    # stop coding in Expensify, and nothing else changes.
+    ("Expensify (today)", "truth_category", 26),
     ("Billable", None, 9), ("Receipt", None, 9),
     ("Status", "status", 9), ("Rationale", "rationale", 50),
 ]

@@ -131,10 +131,10 @@ def cmd_close_run(args):
     else:
         print("receipt vault: skipped (--no-vault)")
 
-    # 3. categorize (history strictly from months before this one)
+    # 3. categorize (history strictly from months before this one; the agent
+    # proposes independently — employee coding is cross-check only)
     ledger.rebuild_merchant_history(conn, cfg.client, through_month=month)
-    stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm,
-                                          blind=args.blind)
+    stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm)
     print(f"categorization: {stats}")
 
     # 4. artifacts
@@ -154,6 +154,7 @@ def cmd_close_run(args):
         "card charges without receipt": len(g["card_without_receipt"]),
         "vault expenses without charge": len(g["vault_without_charge"]),
         "needs reviewer (no proposal)": len(g["uncategorized"]),
+        "agent disagrees with Expensify coding": stats.get("disagrees_with_expensify", 0),
         "statement charges missing from books rec": len(g["rec_report_gaps"]),
         "awaiting next reconciliation": len(g["rec_awaiting"]),
         "books cross-check": g["rec_report_note"],
@@ -231,9 +232,6 @@ def main(argv=None):
     r.add_argument("--month", required=True, help="YYYY-MM")
     r.add_argument("--no-llm", action="store_true")
     r.add_argument("--no-vault", action="store_true")
-    r.add_argument("--blind", action="store_true",
-                   help="ignore employee Expensify coding when proposing — for "
-                        "measuring the agent's independent accuracy")
     r.add_argument("--shadow", action="store_true",
                    help="shadow close: include SUBMITTED reports, freeze the draft")
     r.set_defaults(fn=cmd_close_run)
