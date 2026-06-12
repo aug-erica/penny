@@ -56,6 +56,12 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) ->
                    l["amount_cents"] / 100, l.get("employee") or ""])
     for d, cents in gaps.get("rec_report_gaps", []):
         ws.append(["statement charge missing from books rec", d, "", cents / 100, ""])
+    awaiting = gaps.get("rec_awaiting", [])
+    if awaiting:
+        ws.append(["awaiting next reconciliation (self-resolves — see note)",
+                   f"{awaiting[0][0]} … {awaiting[-1][0]}",
+                   f"{len(awaiting)} charges not yet reconciled in QuickBooks",
+                   sum(c for _, c in awaiting) / 100, ""])
     ws.append([])
     ws.append(["note", "", gaps.get("rec_report_note", ""), "", ""])
     for col, w in zip("ABCDE", (34, 11, 46, 11, 22)):
@@ -84,6 +90,8 @@ def _sheet_of_lines(ws, lines):
                 row.append("YES" if l.get("billable") else "")
             elif title == "Receipt":
                 row.append("yes" if l.get("receipt_link") else "MISSING")
+            elif title == "Proposed COA":
+                row.append(l.get("proposed_coa_line") or "(reviewer to choose)")
             else:
                 row.append(l.get(key) or "")
         ws.append(row)

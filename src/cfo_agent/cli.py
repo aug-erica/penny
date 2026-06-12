@@ -133,7 +133,8 @@ def cmd_close_run(args):
 
     # 3. categorize (history strictly from months before this one)
     ledger.rebuild_merchant_history(conn, cfg.client, through_month=month)
-    stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm)
+    stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm,
+                                          blind=args.blind)
     print(f"categorization: {stats}")
 
     # 4. artifacts
@@ -152,8 +153,9 @@ def cmd_close_run(args):
         "flagged for review": sum(1 for l in active if l["status"] == "flagged"),
         "card charges without receipt": len(g["card_without_receipt"]),
         "vault expenses without charge": len(g["vault_without_charge"]),
-        "uncategorized": len(g["uncategorized"]),
+        "needs reviewer (no proposal)": len(g["uncategorized"]),
         "statement charges missing from books rec": len(g["rec_report_gaps"]),
+        "awaiting next reconciliation": len(g["rec_awaiting"]),
         "books cross-check": g["rec_report_note"],
         "reviewer": cfg.section("reviewer").get("primary", ""),
         "run id / drafted at": f"{run_id} / {ledger.now()}",
@@ -229,6 +231,9 @@ def main(argv=None):
     r.add_argument("--month", required=True, help="YYYY-MM")
     r.add_argument("--no-llm", action="store_true")
     r.add_argument("--no-vault", action="store_true")
+    r.add_argument("--blind", action="store_true",
+                   help="ignore employee Expensify coding when proposing — for "
+                        "measuring the agent's independent accuracy")
     r.add_argument("--shadow", action="store_true",
                    help="shadow close: include SUBMITTED reports, freeze the draft")
     r.set_defaults(fn=cmd_close_run)

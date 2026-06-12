@@ -12,8 +12,12 @@ BANDS = ("high", "medium", "low")
 
 def validate_month(conn, client: str, close_month: str) -> dict:
     lines = ledger.lines_for_month(conn, client, close_month)
+    # Vault-sourced proposals are the employee's own coding — scoring them
+    # against themselves would be circular. Only the agent's independent
+    # judgment (rule/history/llm) is measured.
     scored = [l for l in lines
-              if l.get("proposed_coa_line") and l.get("truth_category")]
+              if l.get("proposed_coa_line") and l.get("truth_category")
+              and l.get("proposed_by") != "vault"]
     by_band = defaultdict(lambda: {"n": 0, "correct": 0})
     by_proposer = defaultdict(lambda: {"n": 0, "correct": 0})
     misses = []

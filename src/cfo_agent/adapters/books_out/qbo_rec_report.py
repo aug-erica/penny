@@ -21,6 +21,7 @@ LINE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(.*?)\s*(-?[\d,]+\.\d{2})$")
 SECTION_CHARGES = re.compile(r"^Charges and cash advances cleared \((\d+)\)")
 SECTION_PAYMENTS = re.compile(r"^Payments and credits cleared \((\d+)\)")
 SECTION_OTHER = re.compile(r"^(Uncleared|Additional Information|Cleared transactions after)")
+PERIOD_END = re.compile(r"Period Ending (\d{2}/\d{2}/\d{4})")
 SUMMARY = {
     "begin": re.compile(r"^Statement beginning balance (-?[\d,]+\.\d{2})$"),
     "charges": re.compile(r"^Charges and cash advances cleared \(\d+\) (-?[\d,]+\.\d{2})$"),
@@ -44,6 +45,7 @@ class QBORecReport:
         self.declared_payment_count: Optional[int] = None
         self.reconciled_by: Optional[str] = None
         self.reconciled_on: Optional[str] = None
+        self.period_end = None   # date — end of the reconciled statement period
         self._parse()
 
     def _parse(self):
@@ -55,6 +57,10 @@ class QBORecReport:
         section = None
         for raw in lines:
             ln = raw.strip()
+            if self.period_end is None:
+                m = PERIOD_END.search(ln)
+                if m:
+                    self.period_end = datetime.strptime(m.group(1), "%m/%d/%Y").date()
             if ln.startswith("Reconciled by:"):
                 self.reconciled_by = ln.split(":", 1)[1].strip()
             if ln.startswith("Reconciled on:"):
@@ -122,7 +128,7 @@ class QBORecReport:
                        and sum(p.amount_cents for p in self.payments) == self.summary.get("payments"))
         return charges_ok, payments_ok
 
-    def containment_gaps(self, statement_charges: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    def containment_gaps(self, statement_charges: List[Tuple[str, int]]) -> dict:
         """Statement charges (date-iso, cents) with no matching cleared charge on
         the same amount within the report. Consumes rec lines greedily so
         duplicates are respected."""
@@ -139,19 +145,29 @@ class MergedRecReports:
         self.declared_charge_count = sum(r.declared_charge_count or 0 for r in reports)
         self.reconciled_by = ", ".join(sorted({r.reconciled_by or "?" for r in reports}))
         self.reconciled_on = ", ".join(r.reconciled_on or "?" for r in reports)
+        ends = [r.period_end for r in reports if r.period_end]
+        self.coverage_end = max(ends) if ends else None
 
     def summary_ties(self) -> bool:
         return all(r.summary_ties() for r in self.reports)
 
-    def containment_gaps(self, statement_charges: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    def containment_gaps(self, statement_charges: List[Tuple[str, int, str]]) -> dict:
+        """Each charge is (txn-date-iso, cents, statement-end-iso). Split:
+        'missing' = posted on an already-reconciled statement but absent from the
+        books (a real discrepancy); 'awaiting' = posted on a statement the
+        bookkeeper hasn't reconciled yet (resolves with the next rec report)."""
         pool: dict = {}
         for c in self.charges:
             pool.setdefault(c.amount_cents, []).append(c.txn_date)
-        gaps = []
-        for d, cents in statement_charges:
+        missing, awaiting = [], []
+        cov = self.coverage_end.isoformat() if self.coverage_end else ""
+        for d, cents, stmt_end in statement_charges:
             cands = pool.get(cents)
             if cands:
                 cands.pop(0)
+            elif stmt_end > cov:
+                awaiting.append((d, cents))
             else:
-                gaps.append((d, cents))
-        return gaps
+                missing.append((d, cents))
+        return {"missing": missing, "awaiting": awaiting,
+                "coverage_end": self.coverage_end}

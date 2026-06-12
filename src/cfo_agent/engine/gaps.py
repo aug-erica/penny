@@ -15,8 +15,9 @@ def gaps_for_month(conn, client: str, close_month: str, rec_report=None) -> dict
                     if not l.get("matched_line_id") and not _reimbursable(l)]
     # Same target set as the categorizer: card charges + reimbursable vault
     # expenses (a matched vault line is the same expense as its card twin).
+    # These carry a needs-reviewer rationale, never a silent blank.
     uncategorized = [l for l in lines
-                     if l["status"] == "draft" and l["amount_cents"] > 0
+                     if l["status"] in ("draft", "flagged") and l["amount_cents"] > 0
                      and (l["source"] == "card_feed" or l.get("reimbursable"))
                      and not l.get("proposed_coa_line")]
 
@@ -25,16 +26,24 @@ def gaps_for_month(conn, client: str, close_month: str, rec_report=None) -> dict
         "vault_without_charge": orphan_vault,
         "uncategorized": uncategorized,
         "rec_report_gaps": [],
+        "rec_awaiting": [],
         "rec_report_note": "no rec report available",
     }
     if rec_report is not None:
-        stmt_charges = [(l["txn_date"], l["amount_cents"]) for l in card]
-        out["rec_report_gaps"] = rec_report.containment_gaps(stmt_charges)
+        # statement_ref is "<card>:<period-end-iso>" — the posting statement
+        # decides whether a charge could be in the books yet.
+        stmt_charges = [(l["txn_date"], l["amount_cents"],
+                         (l.get("statement_ref") or ":").split(":")[1]) for l in card]
+        split = rec_report.containment_gaps(stmt_charges)
+        out["rec_report_gaps"] = split["missing"]
+        out["rec_awaiting"] = split["awaiting"]
+        cov = split["coverage_end"]
         out["rec_report_note"] = (
-            f"rec report: {len(rec_report.charges)} cleared charges "
-            f"(declared {rec_report.declared_charge_count}), summary "
-            f"{'ties' if rec_report.summary_ties() else 'DOES NOT TIE'}; "
-            f"reconciled by {rec_report.reconciled_by} on {rec_report.reconciled_on}"
+            f"books reconciled through {cov} by {rec_report.reconciled_by}; "
+            f"summary {'ties' if rec_report.summary_ties() else 'DOES NOT TIE'}"
+            + (f"; {len(split['awaiting'])} charges after {cov} await the next "
+               f"reconciliation (resolves when that rec report is produced)"
+               if split["awaiting"] else "")
         )
     return out
 
