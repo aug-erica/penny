@@ -161,6 +161,20 @@ def set_proposal(conn, line_id: int, coa_line: str, proposed_by: str,
     conn.commit()
 
 
+def reset_proposals_for_month(conn, client: str, close_month: str):
+    """Clear agent proposals so a re-run re-proposes from scratch. Reviewer
+    decisions (approved/posted) and excluded lines are left untouched — only
+    draft/flagged proposals are wiped back to draft."""
+    conn.execute(
+        """UPDATE ledger_lines SET proposed_coa_line=NULL, proposed_by=NULL,
+           confidence=NULL, rationale=NULL, billable=NULL, status='draft',
+           updated_at=? WHERE client=? AND close_month=?
+           AND status IN ('draft','flagged')""",
+        (now(), client, close_month),
+    )
+    conn.commit()
+
+
 def set_status(conn, line_id: int, status: str):
     conn.execute("UPDATE ledger_lines SET status=?, updated_at=? WHERE id=?",
                  (status, now(), line_id))

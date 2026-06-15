@@ -14,17 +14,23 @@ MODEL = "claude-haiku-4-5-20251001"   # cheap classification; bump if accuracy d
 
 PROMPT = """You are categorizing corporate-card transactions for {client}, a consulting firm, into its chart of accounts.
 
+{guidance}
+
 Valid COA lines (you MUST pick from this list verbatim):
 {coa}
 
-Recent examples of correct coding:
+Recent examples of how this firm actually coded merchants:
 {examples}
 
 Transactions to categorize (JSON):
 {txns}
 
+For each, pick the most likely category. When the merchant name alone can't
+determine intent (e.g. a meal that could be team/client/conference), choose the
+safe default from the guidance and set confident=false.
+
 Reply with a JSON array, one object per transaction, same order:
-{{"i": <index>, "coa_line": "<verbatim from list>", "billable_guess": true|false, "why": "<8 words max>"}}
+{{"i": <index>, "coa_line": "<verbatim from list>", "billable_guess": true|false, "confident": true|false, "why": "<8 words max>"}}
 Reply with the JSON array only."""
 
 
@@ -36,6 +42,7 @@ def propose_batch(conn, cfg, lines: List[dict]) -> List[Tuple[dict, Optional[Pro
     client = anthropic.Anthropic(api_key=api_key)
     coa = cfg.coa_lines
     examples = _examples(conn, cfg.client)
+    guidance = _guidance(cfg)
     out: List[Tuple[dict, Optional[Proposal]]] = []
     for i in range(0, len(lines), BATCH):
         chunk = lines[i:i + BATCH]
@@ -45,7 +52,8 @@ def propose_batch(conn, cfg, lines: List[dict]) -> List[Tuple[dict, Optional[Pro
         msg = client.messages.create(
             model=MODEL, max_tokens=2048,
             messages=[{"role": "user", "content": PROMPT.format(
-                client=cfg.client.title(), coa="\n".join(f"- {c}" for c in coa),
+                client=cfg.client.title(), guidance=guidance,
+                coa="\n".join(f"- {c}" for c in coa),
                 examples=examples, txns=json.dumps(txns))}],
         )
         try:
@@ -57,14 +65,23 @@ def propose_batch(conn, cfg, lines: List[dict]) -> List[Tuple[dict, Optional[Pro
         for j, line in enumerate(chunk):
             a = answers.get(j)
             if a and a.get("coa_line") in coa:
+                # LLM proposals always land in the flagged-for-review band; the
+                # confident flag only sharpens the rationale, never auto-fills.
+                conf = "medium" if a.get("confident") else "low"
                 out.append((line, Proposal(
-                    coa_line=a["coa_line"], proposed_by="llm", confidence="low",
+                    coa_line=a["coa_line"], proposed_by="llm", confidence=conf,
                     rationale=f"LLM: {a.get('why', '')}".strip(),
                     billable=a.get("billable_guess"),
                 )))
             else:
                 out.append((line, None))
     return out
+
+
+def _guidance(cfg) -> str:
+    from ...config import CLIENTS_DIR
+    path = CLIENTS_DIR / cfg.client / "category_guidance.md"
+    return path.read_text() if path.exists() else ""
 
 
 def _examples(conn, client: str, n: int = 30) -> str:

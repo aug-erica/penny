@@ -1,9 +1,38 @@
-# Merchant -> COA rules. Seeded from Jan–Mar Expensify history (build step 7);
-# grows every close via the reviewer correction write-back loop.
-# Rule kinds: exact merchant_norm, substring keyword, cardholder default.
-merchant_rules: []
-#  - match: "ANTHROPIC"
-#    kind: substring
-#    coa_line: "8xxx-Software & Subscriptions"
+# Merchant -> COA rules. These encode August POLICY (stable vendor families
+# whose category doesn't depend on context), not employee coding. They run
+# before history and the LLM, so a first-time charge from a known vendor family
+# is categorized deterministically — no guess needed. Grows via reviewer
+# corrections (this month's correction is next month's rule).
+#
+# kind: substring (matches anywhere in the normalized merchant) | exact
+# Only list vendors whose category is unambiguous regardless of who spent it.
+
+merchant_rules:
+  # --- AI / engineering tools -> R&D AI Everyday (Internal Tools & Training) ---
+  - {match: "ANTHROPIC",  kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "CLAUDE",     kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "OPENAI",     kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "GRANOLA",    kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "CURSOR",     kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "NETLIFY",    kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "VERCEL",     kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "SUPABASE",   kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+  - {match: "RAILWAY",    kind: substring, coa_line: "R&D AI Everyday (Internal Tools & Training)"}
+
+  # --- Book print / fulfillment -> Book Development and Publishing ---
+  - {match: "INGRAMSPARK",   kind: substring, coa_line: "Book Development and Publishing"}
+  - {match: "LIGHTNINGSRC",  kind: substring, coa_line: "Book Development and Publishing"}
+  - {match: "BOX GENIE",     kind: substring, coa_line: "Book Development and Publishing"}
+  - {match: "NOISSUE",       kind: substring, coa_line: "Book Development and Publishing"}
+  - {match: "STICKERGIANT",  kind: substring, coa_line: "Book Development and Publishing"}
+  - {match: "PORCHLIGHT",    kind: substring, coa_line: "Book Development and Publishing"}
+
+  # --- General software / SaaS -> Web Services & Subscriptions ---
+  - {match: "ADOBE",          kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "APPLE.COM/BILL", kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "ZOOM",           kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "FIGMA",          kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "NOTION",         kind: substring, coa_line: "Web Services & Subscriptions"}
+
 keyword_rules: []
 cardholder_defaults: {}

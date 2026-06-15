@@ -133,6 +133,7 @@ def cmd_close_run(args):
 
     # 3. categorize (history strictly from months before this one; the agent
     # proposes independently — employee coding is cross-check only)
+    ledger.reset_proposals_for_month(conn, cfg.client, month)  # idempotent re-runs
     ledger.rebuild_merchant_history(conn, cfg.client, through_month=month)
     stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm)
     print(f"categorization: {stats}")
