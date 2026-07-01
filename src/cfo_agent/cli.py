@@ -276,6 +276,37 @@ def _merge_rules(cfg, new_rules: dict) -> int:
     return added
 
 
+def cmd_notify_build(args):
+    """Assemble each pal's Slack DM from the month's ledger. Prints them (or one,
+    with --only <cardholder>); sending is done separately so nothing goes out by
+    accident."""
+    import yaml
+    from .config import CLIENTS_DIR
+    from .engine import dm_assemble
+
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    bot = cfg.raw.get("bot", {}).get("name", "the expense bot")
+    proj_data = yaml.safe_load((CLIENTS_DIR / cfg.client / cfg.section("billable")
+                                .get("billable_projects_file", "active_projects.yaml")).read_text())
+    projects = (proj_data.get(args.month, {}) or {}).get("projects", [])
+
+    lines = ledger.lines_for_month(conn, cfg.client, args.month)
+    by_pal = {}
+    for l in lines:
+        if l["source"] != "card_feed" and not l.get("reimbursable"):
+            continue
+        by_pal.setdefault(l.get("cardholder") or "(unknown)", []).append(l)
+
+    for pal, pal_lines in sorted(by_pal.items()):
+        if args.only and args.only.lower() not in pal.lower():
+            continue
+        first = pal.split()[0]
+        dm = dm_assemble.assemble_dm(first, pal_lines, projects, bot)
+        print(f"\n===== DM → {pal} =====\n{dm}\n")
+    return 0
+
+
 def cmd_vault_smoke(args):
     cfg = load_client(args.client)
     vault = _vault(cfg)
@@ -340,6 +371,14 @@ def main(argv=None):
     ing.add_argument("--client", required=True)
     ing.add_argument("--file", required=True, help="the reviewed review_<month>.xlsx")
     ing.set_defaults(fn=cmd_close_ingest_review)
+
+    notify = sub.add_parser("notify")
+    nsub = notify.add_subparsers(dest="subcmd", required=True)
+    nb = nsub.add_parser("build")
+    nb.add_argument("--client", required=True)
+    nb.add_argument("--month", required=True)
+    nb.add_argument("--only", default=None, help="only this cardholder (substring match)")
+    nb.set_defaults(fn=cmd_notify_build)
 
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)

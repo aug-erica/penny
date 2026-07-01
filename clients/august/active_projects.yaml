@@ -1,0 +1,28 @@
+# Active projects (confirmed revenue) by close month — the billable-tagging
+# list pals choose from. Pulled from HubSpot (Closed Won deals whose service
+# window overlaps the month). Refreshed each close; see
+# adapters/projects/hubspot_projects.py for the query + the "closedwon" gotcha.
+"2026-06":
+  refreshed: "2026-07-01"
+  projects:
+    - {project: "Transcarent Leadership Offsite", client: "Accolade/Transcarent"}
+    - {project: "ACLU Equitable Sharing Extension (Oct'25–Sep'26)", client: "ACLU"}
+    - {project: "ACLU Privacy Governance RFP", client: "ACLU"}
+    - {project: "Colgate Skin Health – Reorg Support", client: "Colgate"}
+    - {project: "DOT – Gartner MWBE Subcontract", client: "Gartner"}
+    - {project: "Genentech External Affairs Leadership Forum", client: "Genentech"}
+    - {project: "Genentech L&SD Sprint", client: "Genentech"}
+    - {project: "Genentech Strategic Change Leadership Capacity Support", client: "Genentech"}
+    - {project: "Google AI Role Evolution Workshop", client: "Google"}
+    - {project: "Hudson Valley Credit Union Org Transformation", client: "Hudson Valley CU"}
+    - {project: "Link Logistics Governance Phase 2", client: "Link Logistics"}
+    - {project: "Marriott Gear Up Design", client: "Marriott"}
+    - {project: "McCain Jan 2026 Extension", client: "McCain"}
+    - {project: "McCain WOMB PACE", client: "McCain"}
+    - {project: "Meta – Book Salon", client: "Meta"}
+    - {project: "NYCPS Leadership Symposium Keynote", client: "NYC Public Schools"}
+    - {project: "FACE LT Retreat June 2026", client: "NYC Public Schools"}
+    - {project: "PPFA Development Org Design and Advisory 2026", client: "PPFA"}
+    - {project: "Selective Insurance Decision Making", client: "Selective"}
+    - {project: "Siemens Mobility – LT Facilitation & Coaching", client: "Siemens"}
+    - {project: "UNICEF Marketing Advisory Group SLAM Team & Coaching", client: "UNICEF USA"}

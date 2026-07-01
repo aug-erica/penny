@@ -7,6 +7,12 @@ reviewer:
   primary: "Purvi Patel"      # August-side approver and human-in-the-loop
   secondary: "Erica Seldin"
 
+# The expense bot's Slack identity (dedicated bot user). Used in DM copy + as
+# the sender once the Slack app is created and installed.
+bot:
+  name: "Flo"
+  handle: "@Flo"
+
 data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Shared drives/August Brain/06_Operations/CFO Agent"
 close_data_dir: "2026 Month End Close"   # relative to data_root
 runs_dir: "runs"                          # relative to data_root; review artifacts land here
@@ -58,6 +64,14 @@ billable:
   # it hits client invoices and the ~10% T&E cap per SOW.
   always_flag: true
   billable_categories: ["Billable Expense"]
+  # Billable expenses tag to a specific PROJECT (not just a client), because
+  # only project-tagged spend gets included/re-billed. The valid list = Closed
+  # Won HubSpot deals whose service window overlaps the close month (Option A —
+  # HubSpot is the upstream source of the dashboard's Confirmed Revenue tab and
+  # is fully automatable). Refreshed each close into active_projects.yaml; the
+  # pull logic + the "closedwon"-stage gotcha live in
+  # adapters/projects/hubspot_projects.py. Headless refresh needs HUBSPOT_TOKEN.
+  billable_projects_file: "active_projects.yaml"
 
 # Event windows encode calendar context the card feed can't carry: during an
 # in-person/Summit week or a launch push, ordinary food/travel/local spend is
