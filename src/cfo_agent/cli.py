@@ -307,6 +307,49 @@ def cmd_notify_build(args):
     return 0
 
 
+def cmd_notify_collect(args):
+    """Apply a pal's reply: interpret which charges are billable + to which
+    project, and write it back to the ledger. Reply text via --reply or
+    --reply-file (Slack thread reading is done via the connector and piped in)."""
+    import yaml
+    from .config import CLIENTS_DIR
+    from .engine import reply_parse
+
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    reply = args.reply or (Path(args.reply_file).read_text() if args.reply_file else "")
+    if not reply.strip():
+        print("no reply text provided (--reply or --reply-file)")
+        return 1
+
+    proj_data = yaml.safe_load((CLIENTS_DIR / cfg.client / "active_projects.yaml").read_text())
+    projects = [p["project"] for p in (proj_data.get(args.month, {}) or {}).get("projects", [])]
+
+    lines = ledger.lines_for_month(conn, cfg.client, args.month)
+    charges = [l for l in lines
+               if (l.get("cardholder") or "").lower().find(args.pal.lower()) >= 0
+               and l["status"] != "excluded" and l["amount_cents"] > 0]
+    if not charges:
+        print(f"no June charges found for cardholder matching '{args.pal}'")
+        return 1
+
+    decisions = reply_parse.interpret_reply(cfg.client, reply, charges, projects)
+    if not decisions:
+        print("couldn't interpret the reply into charge decisions (nothing changed).")
+        return 0
+    by_ext = {c["external_id"]: c for c in charges}
+    for d in decisions:
+        line = by_ext.get(d["external_id"])
+        if not line:
+            continue
+        ledger.set_billable_project(conn, line["id"], 1 if d["billable"] else 0,
+                                    d["project"])
+        tag = f"billable → {d['project']}" if d["billable"] else "not billable"
+        print(f"  {d['merchant'][:34]:34s} {tag}")
+    print(f"\napplied {len(decisions)} decision(s) from {args.pal}'s reply.")
+    return 0
+
+
 def cmd_vault_smoke(args):
     cfg = load_client(args.client)
     vault = _vault(cfg)
@@ -379,6 +422,13 @@ def main(argv=None):
     nb.add_argument("--month", required=True)
     nb.add_argument("--only", default=None, help="only this cardholder (substring match)")
     nb.set_defaults(fn=cmd_notify_build)
+    nc = nsub.add_parser("collect")
+    nc.add_argument("--client", required=True)
+    nc.add_argument("--month", required=True)
+    nc.add_argument("--pal", required=True, help="cardholder name (substring match)")
+    nc.add_argument("--reply", default=None, help="the pal's reply text")
+    nc.add_argument("--reply-file", default=None)
+    nc.set_defaults(fn=cmd_notify_collect)
 
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)

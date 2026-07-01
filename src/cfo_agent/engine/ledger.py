@@ -70,6 +70,13 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
+    # Additive migrations for DBs created before a column existed.
+    for col, decl in (("project", "TEXT"), ("receipt_status", "TEXT")):
+        try:
+            conn.execute(f"ALTER TABLE ledger_lines ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # already present
+    conn.commit()
     return conn
 
 
@@ -185,6 +192,21 @@ def line_by_external_id(conn, client: str, external_id: str):
 def set_status(conn, line_id: int, status: str):
     conn.execute("UPDATE ledger_lines SET status=?, updated_at=? WHERE id=?",
                  (status, now(), line_id))
+    conn.commit()
+
+
+def set_billable_project(conn, line_id: int, billable, project=None):
+    conn.execute(
+        """UPDATE ledger_lines SET billable=COALESCE(?, billable),
+           project=COALESCE(?, project), updated_at=? WHERE id=?""",
+        (billable, project, now(), line_id))
+    conn.commit()
+
+
+def set_receipt_status(conn, line_id: int, status: str, link: str = None):
+    conn.execute(
+        """UPDATE ledger_lines SET receipt_status=?, receipt_link=COALESCE(?, receipt_link),
+           updated_at=? WHERE id=?""", (status, link, now(), line_id))
     conn.commit()
 
 
