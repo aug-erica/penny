@@ -11,6 +11,23 @@ data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Sha
 close_data_dir: "2026 Month End Close"   # relative to data_root
 runs_dir: "runs"                          # relative to data_root; review artifacts land here
 
+# Card last-4 -> cardholder. Used by CSV/feed adapters that carry only the card
+# number (statements carry the name inline). From the Chase Employees list.
+cardholders:
+  "8303": "Erica Seldin"          # main account card
+  "9768": "Alexis Black"
+  "7325": "Finance / AP Card"
+  "5936": "Jasbir Punia"
+  "3489": "K. Mascarenaz"
+  "9867": "Karina Mangu-Ward"
+  "1241": "Levi Baer"
+  "8311": "Mike Arauz"
+  "6878": "Michael Burkin"
+  "8564": "Melissa Shamis"
+  "6761": "Purvi Patel"
+  "7416": "Samantha Lozzi"
+  "6369": "Tirzah Enumah"
+
 card_feed:
   type: chase_statement_pdf
   account_last4: "8303"

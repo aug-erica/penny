@@ -35,7 +35,17 @@ def _month_bounds(month: str):
     return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
 
 
-def _card_feed(cfg: ClientConfig):
+def _card_feed(cfg: ClientConfig, card_csv: str = None):
+    # Explicit CSV export overrides the configured feed for this run (bridge
+    # source until the daily QBO feed is wired). Doesn't touch config, so the
+    # PDF-based historical months still rebuild cleanly.
+    if card_csv:
+        from .adapters.card_feed.chase_activity_csv import ChaseActivityCSV
+        return ChaseActivityCSV(
+            csv_path=Path(card_csv),
+            cardholders=cfg.raw.get("cardholders", {}),
+            account_last4=cfg.section("card_feed").get("account_last4", ""),
+        )
     c = cfg.section("card_feed")
     if c.get("type") == "chase_statement_pdf":
         from .adapters.card_feed.chase_statement_pdf import ChaseStatementPDF
@@ -102,7 +112,7 @@ def cmd_close_run(args):
           + (" [SHADOW — frozen draft, blind to current truth]" if args.shadow else ""))
 
     # 1. card feed (verify first; refuse to run on parse mismatch)
-    feed = _card_feed(cfg)
+    feed = _card_feed(cfg, card_csv=args.card_csv)
     bad = [c for c in feed.verify() if not c.ok]
     if bad:
         for c in bad:
@@ -243,6 +253,9 @@ def main(argv=None):
     r.add_argument("--month", required=True, help="YYYY-MM")
     r.add_argument("--no-llm", action="store_true")
     r.add_argument("--no-vault", action="store_true")
+    r.add_argument("--card-csv", default=None,
+                   help="use a Chase activity CSV export as the card feed for "
+                        "this run (overrides the configured feed)")
     r.add_argument("--shadow", action="store_true",
                    help="shadow close: include SUBMITTED reports, freeze the draft")
     r.set_defaults(fn=cmd_close_run)
