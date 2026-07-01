@@ -49,10 +49,19 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     receipts_needed = [l for l in charges
                        if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
 
-    out = [f"👋 Hey {pal_first} — it's {bot_name}, August's expense bot. "
-           f"Good news: *no expense report to file for June.* I've already pulled and "
-           f"categorized your {len(charges)} August-card charges ({_money(total)}). "
-           f"Just need a couple of quick things from you."]
+    out = [f"👋 Hey {pal_first} — it's {bot_name}, August's expense bot. I've pulled and "
+           f"categorized your {len(charges)} August-card charges for June ({_money(total)}). "
+           f"Here's what I've got — give it a look, then a couple quick things below."]
+
+    # The full categorized list, so pals can see (and trust) every call Flo made.
+    out.append("\n*Your June expenses, as I categorized them:*")
+    out.append("| Date | Merchant | Amount | Category |")
+    out.append("|---|---|---:|---|")
+    for l in sorted(charges, key=lambda l: l["txn_date"]):
+        merch = _merchant(l["merchant_raw"])
+        merch = merch[:28] + "…" if len(merch) > 29 else merch
+        out.append(f"| {l['txn_date'][5:]} | {merch} | {_money(l['amount_cents'])} "
+                   f"| {l.get('proposed_coa_line') or '—'} |")
 
     marks = ["1️⃣", "2️⃣", "3️⃣"]
     step = iter(marks)
