@@ -94,3 +94,38 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     out.append("\n_Reimbursables (personal card, WiFi, cell) still go in Expensify for now — "
                "this is just your August card._")
     return "\n".join(out)
+
+
+def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
+    """After interpreting a reply, echo exactly what was recorded so the pal can
+    catch a miss (the conservative interpreter under-tags rather than guess)."""
+    charges = [l for l in charges if l["status"] != "excluded" and l["amount_cents"] > 0]
+    candidates = [l for l in charges if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
+    # Any charge tagged billable+project counts (a pal can bill a non-travel item).
+    billable = [l for l in charges if l.get("billable") and l.get("project")]
+    not_billable = [l for l in candidates if l.get("billable") == 0]
+    untagged = [l for l in candidates
+                if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
+    needed = [l for l in charges if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
+    missing_receipts = [l for l in needed if l.get("receipt_status") != "received"]
+
+    out = [f"Thanks {pal_first}! Here's what I recorded — reply if any of it's off:"]
+    if billable:
+        out.append("\n✅ *Billable:*")
+        for l in billable:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} → {l['project']}")
+    if not_billable:
+        out.append(f"\n🚫 *Not billable:* {len(not_billable)} charge(s) — got it.")
+    if untagged:
+        out.append("\n❓ *Still need a call on these* — billable to which project, or not?")
+        for l in untagged:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['txn_date'][5:]})")
+    if missing_receipts:
+        out.append("\n📎 *Still need receipts for:*")
+        for l in missing_receipts:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])}")
+    elif needed:
+        out.append("\n📎 Receipts: all in — thank you!")
+    if not untagged and not missing_receipts:
+        out.append("\nYou're all set. 🎉 Nothing else needed.")
+    return "\n".join(out)

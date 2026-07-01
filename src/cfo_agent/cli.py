@@ -347,6 +347,35 @@ def cmd_notify_collect(args):
         tag = f"billable → {d['project']}" if d["billable"] else "not billable"
         print(f"  {d['merchant'][:34]:34s} {tag}")
     print(f"\napplied {len(decisions)} decision(s) from {args.pal}'s reply.")
+
+    # Confirm-back: echo the full recorded state so the pal can catch a miss.
+    from .engine import dm_assemble
+    bot = cfg.raw.get("bot", {}).get("name", "the expense bot")
+    fresh = [l for l in ledger.lines_for_month(conn, cfg.client, args.month)
+             if (l.get("cardholder") or "").lower().find(args.pal.lower()) >= 0]
+    print("\n----- confirm-back message -----")
+    print(dm_assemble.confirm_back(args.pal.split()[0], fresh, bot))
+    return 0
+
+
+def cmd_notify_receipt(args):
+    """Record a receipt a pal sent, matched to its charge by amount."""
+    from .engine import receipts
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    charges = [l for l in ledger.lines_for_month(conn, cfg.client, args.month)
+               if (l.get("cardholder") or "").lower().find(args.pal.lower()) >= 0]
+    cents = round(float(args.amount) * 100)
+    matches = receipts.match_by_amount(charges, cents)
+    if not matches:
+        print(f"no un-receipted charge needing a receipt at ${args.amount} for {args.pal}")
+        return 1
+    if len(matches) > 1:
+        print(f"ambiguous — {len(matches)} charges at ${args.amount}; recording against the first:")
+    m = matches[0]
+    receipts.record(conn, m["id"], args.link)
+    print(f"  receipt recorded: {m['merchant_raw'][:34]} ${cents/100:.2f}"
+          + (f"  ({args.link})" if args.link else ""))
     return 0
 
 
@@ -429,6 +458,13 @@ def main(argv=None):
     nc.add_argument("--reply", default=None, help="the pal's reply text")
     nc.add_argument("--reply-file", default=None)
     nc.set_defaults(fn=cmd_notify_collect)
+    nr = nsub.add_parser("receipt")
+    nr.add_argument("--client", required=True)
+    nr.add_argument("--month", required=True)
+    nr.add_argument("--pal", required=True)
+    nr.add_argument("--amount", required=True, help="receipt amount in dollars")
+    nr.add_argument("--link", default=None, help="Slack file URL / vault reference")
+    nr.set_defaults(fn=cmd_notify_receipt)
 
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)

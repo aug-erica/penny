@@ -196,9 +196,10 @@ def set_status(conn, line_id: int, status: str):
 
 
 def set_billable_project(conn, line_id: int, billable, project=None):
+    # Set both directly (not COALESCE): a reply is a definite decision, and a
+    # "not billable" reply must clear any previously-tagged project.
     conn.execute(
-        """UPDATE ledger_lines SET billable=COALESCE(?, billable),
-           project=COALESCE(?, project), updated_at=? WHERE id=?""",
+        "UPDATE ledger_lines SET billable=?, project=?, updated_at=? WHERE id=?",
         (billable, project, now(), line_id))
     conn.commit()
 
