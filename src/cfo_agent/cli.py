@@ -183,7 +183,8 @@ def cmd_close_run(args):
         "run id / drafted at": f"{run_id} / {ledger.now()}",
     }
     out_dir = cfg.runs_dir / month
-    wb = review.write_review_workbook(lines, g, summary, out_dir / f"review_{month}.xlsx")
+    wb = review.write_review_workbook(lines, g, summary, out_dir / f"review_{month}.xlsx",
+                                      coa_lines=cfg.coa_lines)
     print(f"review workbook: {wb}")
     for k, v in summary.items():
         print(f"  {k}: {v}")
