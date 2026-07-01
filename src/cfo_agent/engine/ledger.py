@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS ledger_lines (
   matched_line_id    INTEGER REFERENCES ledger_lines(id),
   match_score        REAL,
   proposed_coa_line  TEXT,
-  proposed_by        TEXT CHECK (proposed_by IN ('vault','rule','history','llm','event') OR proposed_by IS NULL),
+  proposed_by        TEXT CHECK (proposed_by IN ('vault','rule','history','llm','event','reviewer') OR proposed_by IS NULL),
   confidence         TEXT CHECK (confidence IN ('high','medium','low') OR confidence IS NULL),
   billable           INTEGER,
   receipt_link       TEXT,
@@ -173,6 +173,13 @@ def reset_proposals_for_month(conn, client: str, close_month: str):
         (now(), client, close_month),
     )
     conn.commit()
+
+
+def line_by_external_id(conn, client: str, external_id: str):
+    r = conn.execute(
+        "SELECT * FROM ledger_lines WHERE client=? AND external_id=?",
+        (client, external_id)).fetchone()
+    return dict(r) if r else None
 
 
 def set_status(conn, line_id: int, status: str):

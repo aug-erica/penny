@@ -203,6 +203,78 @@ def cmd_close_validate(args):
     return 0
 
 
+def cmd_close_ingest_review(args):
+    """Read Purvi's reviewed workbook back in: book every line as approved with
+    the reviewer's final category, and turn each correction into a merchant rule
+    for next month (the flywheel)."""
+    from .engine import review_ingest
+    from .engine.normalize import normalize_merchant
+
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    coa = set(cfg.coa_lines)
+    reviewed = review_ingest.read_reviewed(Path(args.file))
+
+    approved = corrections = skipped = 0
+    new_rules = {}   # merchant_norm -> coa_line
+    for r in reviewed:
+        line = ledger.line_by_external_id(conn, cfg.client, r["external_id"])
+        if not line:
+            skipped += 1
+            continue
+        final = r["final_coa"]
+        if not final or final not in coa:
+            skipped += 1
+            continue
+        changed = final != line.get("proposed_coa_line")
+        billable = 1 if r["billable"] else (0 if r["billable"] is not None else line.get("billable"))
+        ledger.set_proposal(conn, line["id"], final,
+                            "reviewer" if changed else (line.get("proposed_by") or "reviewer"),
+                            "high", ("reviewer-approved"
+                                     + (f" (was {line.get('proposed_coa_line')})" if changed else "")),
+                            billable=billable, status="approved")
+        approved += 1
+        if changed:
+            corrections += 1
+            new_rules[normalize_merchant(line["merchant_raw"])] = final
+
+    # 'reviewer' is a valid proposer for approved decisions.
+    written = _merge_rules(cfg, new_rules)
+    print(f"ingested {approved} approved lines ({corrections} corrections, "
+          f"{skipped} skipped/unmatched)")
+    if written:
+        print(f"wrote {written} new merchant rule(s) to clients/{cfg.client}/rules.yaml "
+              f"— they take effect next close")
+    print("approved decisions now feed merchant history as the top-authority source.")
+    return 0
+
+
+def _merge_rules(cfg, new_rules: dict) -> int:
+    """Append reviewer corrections as exact merchant rules; skip ones already
+    covered by an identical rule."""
+    import yaml
+    from .config import CLIENTS_DIR
+    if not new_rules:
+        return 0
+    path = CLIENTS_DIR / cfg.client / "rules.yaml"
+    data = yaml.safe_load(path.read_text()) or {}
+    rules = data.get("merchant_rules") or []
+    existing = {(r.get("match", "").upper(), r.get("coa_line")) for r in rules}
+    added = 0
+    for merch, coa in new_rules.items():
+        key = (merch.upper(), coa)
+        if key in existing or not merch:
+            continue
+        rules.append({"match": merch, "kind": "exact", "coa_line": coa,
+                      "source": "reviewer-correction"})
+        existing.add(key)
+        added += 1
+    if added:
+        data["merchant_rules"] = rules
+        path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+    return added
+
+
 def cmd_vault_smoke(args):
     cfg = load_client(args.client)
     vault = _vault(cfg)
@@ -263,6 +335,10 @@ def main(argv=None):
     val.add_argument("--client", required=True)
     val.add_argument("--month", required=True)
     val.set_defaults(fn=cmd_close_validate)
+    ing = csub.add_parser("ingest-review")
+    ing.add_argument("--client", required=True)
+    ing.add_argument("--file", required=True, help="the reviewed review_<month>.xlsx")
+    ing.set_defaults(fn=cmd_close_ingest_review)
 
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)

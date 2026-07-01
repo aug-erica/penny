@@ -1,5 +1,11 @@
 """The review surface: one xlsx workbook per close, written locally then moved
-into the Drive runs folder atomically (Drive sync dislikes in-place writes)."""
+into the Drive runs folder atomically (Drive sync dislikes in-place writes).
+
+The 'Proposed COA' column is an editable dropdown (the full chart of accounts):
+the reviewer corrects any wrong line in place. On re-import (`cfo close
+ingest-review`) each change becomes both the approved category and a rule for
+next month. A hidden ID column carries external_id so edits map back exactly.
+"""
 from __future__ import annotations
 
 import shutil
@@ -8,6 +14,8 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 FILLS = {
     "high": PatternFill("solid", start_color="C6EFCE"),
@@ -16,20 +24,26 @@ FILLS = {
 }
 HEADER_FONT = Font(bold=True)
 
+# (header, line-key, width). Proposed COA is the editable decision column.
 LEDGER_COLS = [
     ("Date", "txn_date", 11), ("Merchant", "merchant_raw", 42),
     ("Amount", None, 11), ("Cardholder", "cardholder", 18),
-    ("Employee", "employee", 24), ("Proposed COA", "proposed_coa_line", 26),
+    ("Employee", "employee", 24), ("Proposed COA", "proposed_coa_line", 30),
     ("Conf", "confidence", 8), ("By", "proposed_by", 8),
     # Cross-check only, never a proposal source — goes away when employees
     # stop coding in Expensify, and nothing else changes.
     ("Expensify (today)", "truth_category", 26),
     ("Billable", None, 9), ("Receipt", None, 9),
     ("Status", "status", 9), ("Rationale", "rationale", 50),
+    ("ID", "external_id", 26),   # hidden — re-import key
 ]
+COA_COL = next(i for i, c in enumerate(LEDGER_COLS, 1) if c[0] == "Proposed COA")
+BILLABLE_COL = next(i for i, c in enumerate(LEDGER_COLS, 1) if c[0] == "Billable")
+ID_COL = len(LEDGER_COLS)
 
 
-def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) -> Path:
+def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path,
+                          coa_lines: list = None) -> Path:
     wb = Workbook()
 
     ws = wb.active
@@ -37,15 +51,26 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) ->
     ws.append(["Expense Close — agent draft (nothing posts without approval)"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([])
+    ws.append(["How to review: fix any wrong category in the 'Proposed COA' "
+               "dropdown on the Ledger tab, then save. We re-import your edits — "
+               "each fix is booked and becomes a rule for next month."])
+    ws.append([])
     for k, v in summary.items():
         ws.append([k, v])
     ws.column_dimensions["A"].width = 46
     ws.column_dimensions["B"].width = 60
 
+    # Hidden sheet holding the COA list, so the dropdown isn't capped at 255 chars.
+    coa_lines = coa_lines or []
+    lists = wb.create_sheet("_lists")
+    for i, name in enumerate(coa_lines, 1):
+        lists.cell(row=i, column=1, value=name)
+    lists.sheet_state = "hidden"
+
     ws = wb.create_sheet("Ledger")
-    # One row per real expense; matched vault twins live behind their card line.
     _sheet_of_lines(ws, [l for l in lines if l["status"] != "excluded"
-                         and (l["source"] == "card_feed" or l.get("reimbursable"))])
+                         and (l["source"] == "card_feed" or l.get("reimbursable"))],
+                    coa_count=len(coa_lines))
 
     ws = wb.create_sheet("Gaps")
     ws.append(["Gap type", "Date", "Merchant / detail", "Amount", "Who"])
@@ -71,7 +96,7 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) ->
         ws.column_dimensions[col].width = w
 
     ws = wb.create_sheet("Excluded")
-    _sheet_of_lines(ws, [l for l in lines if l["status"] == "excluded"])
+    _sheet_of_lines(ws, [l for l in lines if l["status"] == "excluded"], coa_count=0)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
@@ -80,7 +105,7 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path) ->
     return dest
 
 
-def _sheet_of_lines(ws, lines):
+def _sheet_of_lines(ws, lines, coa_count=0):
     ws.append([c[0] for c in LEDGER_COLS])
     for c in ws[1]:
         c.font = HEADER_FONT
@@ -100,7 +125,22 @@ def _sheet_of_lines(ws, lines):
         ws.append(row)
         conf = l.get("confidence")
         if conf in FILLS:
-            ws.cell(row=ws.max_row, column=7).fill = FILLS[conf]
+            ws.cell(row=ws.max_row, column=COA_COL).fill = FILLS[conf]
     for i, (_, _, w) in enumerate(LEDGER_COLS, start=1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.column_dimensions[get_column_letter(ID_COL)].hidden = True
     ws.freeze_panes = "A2"
+
+    last = ws.max_row
+    if coa_count and last >= 2:
+        coa_ref = f"_lists!$A$1:$A${coa_count}"
+        dv = DataValidation(type="list", formula1=coa_ref, allow_blank=True)
+        dv.error = "Pick a category from the list."
+        dv.prompt = "Choose the correct chart-of-accounts category."
+        ws.add_data_validation(dv)
+        col = get_column_letter(COA_COL)
+        dv.add(f"{col}2:{col}{last}")
+        bdv = DataValidation(type="list", formula1='"YES,NO"', allow_blank=True)
+        ws.add_data_validation(bdv)
+        bcol = get_column_letter(BILLABLE_COL)
+        bdv.add(f"{bcol}2:{bcol}{last}")
