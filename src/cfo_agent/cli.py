@@ -45,6 +45,10 @@ def _card_feed(cfg: ClientConfig):
             statement_glob=c["statement_glob"],
             account_last4=c["account_last4"],
         )
+    if c.get("type") == "qbo_feed":
+        from .adapters.card_feed.qbo_feed import QBOFeed
+        return QBOFeed(account_ref=c.get("account_ref", ""),
+                       realm_id=env("QBO_REALM_ID"))
     raise SystemExit(f"Unknown card_feed type: {c.get('type')}")
 
 
