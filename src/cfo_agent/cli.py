@@ -377,8 +377,10 @@ def cmd_notify_collect(args):
 
 
 def cmd_notify_receipt(args):
-    """Record a receipt a pal sent, matched to its charge by amount."""
-    from .engine import receipts
+    """Record a receipt a pal sent, matched to its charge by amount.
+    --file <path> actually STORES the file in the repository ('stored').
+    --link <ref> only records a pointer ('referenced' — not retained)."""
+    from .engine import receipts, receipt_store
     cfg = load_client(args.client)
     conn = _db(cfg)
     charges = [l for l in ledger.lines_for_month(conn, cfg.client, args.month)
@@ -389,11 +391,16 @@ def cmd_notify_receipt(args):
         print(f"no un-receipted charge needing a receipt at ${args.amount} for {args.pal}")
         return 1
     if len(matches) > 1:
-        print(f"ambiguous — {len(matches)} charges at ${args.amount}; recording against the first:")
+        print(f"ambiguous — {len(matches)} charges at ${args.amount}; using the first:")
     m = matches[0]
-    receipts.record(conn, m["id"], args.link)
-    print(f"  receipt recorded: {m['merchant_raw'][:34]} ${cents/100:.2f}"
-          + (f"  ({args.link})" if args.link else ""))
+    if args.file:
+        dest = receipt_store.store_file(cfg, args.month, args.pal, m, Path(args.file))
+        ledger.set_receipt_status(conn, m["id"], "stored", str(dest))
+        print(f"  receipt STORED: {m['merchant_raw'][:30]} ${cents/100:.2f} → {dest}")
+    else:
+        ledger.set_receipt_status(conn, m["id"], "referenced", args.link)
+        print(f"  receipt REFERENCED only (file NOT retained): {m['merchant_raw'][:30]} "
+              f"${cents/100:.2f} — needs the @Flo token to fetch {args.link}")
     return 0
 
 
@@ -481,7 +488,8 @@ def main(argv=None):
     nr.add_argument("--month", required=True)
     nr.add_argument("--pal", required=True)
     nr.add_argument("--amount", required=True, help="receipt amount in dollars")
-    nr.add_argument("--link", default=None, help="Slack file URL / vault reference")
+    nr.add_argument("--file", default=None, help="local path to the receipt file (stored in repo)")
+    nr.add_argument("--link", default=None, help="Slack file ref (referenced only, not retained)")
     nr.set_defaults(fn=cmd_notify_receipt)
 
     vault = sub.add_parser("vault")

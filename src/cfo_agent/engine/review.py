@@ -117,7 +117,8 @@ def _sheet_of_lines(ws, lines, coa_count=0):
             elif title == "Billable":
                 row.append("YES" if l.get("billable") else "")
             elif title == "Receipt":
-                row.append("yes" if l.get("receipt_link") else "MISSING")
+                row.append({"stored": "stored", "referenced": "ref-only (not filed)"}
+                           .get(l.get("receipt_status"), "MISSING"))
             elif title == "Proposed COA":
                 row.append(l.get("proposed_coa_line") or "(reviewer to choose)")
             else:
