@@ -333,11 +333,8 @@ def cmd_notify_collect(args):
         print(f"no June charges found for cardholder matching '{args.pal}'")
         return 1
 
-    decisions = reply_parse.interpret_reply(cfg.client, reply, charges, projects)
-    if not decisions:
-        print("couldn't interpret the reply into charge decisions (nothing changed).")
-        return 0
     by_ext = {c["external_id"]: c for c in charges}
+    decisions = reply_parse.interpret_reply(cfg.client, reply, charges, projects)
     for d in decisions:
         line = by_ext.get(d["external_id"])
         if not line:
@@ -346,7 +343,28 @@ def cmd_notify_collect(args):
                                     d["project"])
         tag = f"billable → {d['project']}" if d["billable"] else "not billable"
         print(f"  {d['merchant'][:34]:34s} {tag}")
-    print(f"\napplied {len(decisions)} decision(s) from {args.pal}'s reply.")
+
+    # Category corrections in the reply — apply + capture as a rule (flywheel).
+    from .engine.normalize import normalize_merchant
+    recats = reply_parse.interpret_recategorizations(cfg.client, reply, charges, cfg.coa_lines)
+    new_rules = {}
+    for r in recats:
+        line = by_ext.get(r["external_id"])
+        if not line:
+            continue
+        ledger.set_proposal(conn, line["id"], r["new_category"], "reviewer", "high",
+                            f"recategorized by {args.pal.split()[0]}: {r['why']}".strip(),
+                            status="flagged")
+        new_rules[normalize_merchant(line["merchant_raw"])] = r["new_category"]
+        print(f"  {r['merchant'][:34]:34s} recategorized {r['old']} → {r['new_category']}")
+    written = _merge_rules(cfg, new_rules)
+
+    total = len(decisions) + len(recats)
+    if not total:
+        print("couldn't interpret the reply into changes (nothing changed).")
+        return 0
+    print(f"\napplied {len(decisions)} billable/project + {len(recats)} recategorization(s)"
+          + (f"; wrote {written} rule(s)" if written else "") + f" from {args.pal}'s reply.")
 
     # Confirm-back: echo the full recorded state so the pal can catch a miss.
     from .engine import dm_assemble

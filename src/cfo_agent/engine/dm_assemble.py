@@ -109,7 +109,13 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
     needed = [l for l in charges if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
     missing_receipts = [l for l in needed if l.get("receipt_status") != "received"]
 
+    recategorized = [l for l in charges if l.get("proposed_by") == "reviewer"]
+
     out = [f"Thanks {pal_first}! Here's what I recorded — reply if any of it's off:"]
+    if recategorized:
+        out.append("\n✏️ *Recategorized:*")
+        for l in recategorized:
+            out.append(f"   • {_merchant(l['merchant_raw'])} → {l['proposed_coa_line']}")
     if billable:
         out.append("\n✅ *Billable:*")
         for l in billable:
