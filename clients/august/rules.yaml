@@ -33,6 +33,9 @@ merchant_rules:
   - {match: "ZOOM",           kind: substring, coa_line: "Web Services & Subscriptions"}
   - {match: "FIGMA",          kind: substring, coa_line: "Web Services & Subscriptions"}
   - {match: "NOTION",         kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "HBR",            kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "HARVARD BUSINESS", kind: substring, coa_line: "Web Services & Subscriptions"}
+  - {match: "LINKEDIN",       kind: substring, coa_line: "Web Services & Subscriptions"}
 
 keyword_rules: []
 cardholder_defaults: {}

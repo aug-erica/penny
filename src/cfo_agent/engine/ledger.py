@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS ledger_lines (
   matched_line_id    INTEGER REFERENCES ledger_lines(id),
   match_score        REAL,
   proposed_coa_line  TEXT,
-  proposed_by        TEXT CHECK (proposed_by IN ('vault','rule','history','llm') OR proposed_by IS NULL),
+  proposed_by        TEXT CHECK (proposed_by IN ('vault','rule','history','llm','event') OR proposed_by IS NULL),
   confidence         TEXT CHECK (confidence IN ('high','medium','low') OR confidence IS NULL),
   billable           INTEGER,
   receipt_link       TEXT,

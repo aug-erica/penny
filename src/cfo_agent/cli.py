@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from .config import ClientConfig, env, load_client
+from .engine import events
 from .engine import gaps as gaps_mod
 from .engine import ledger
 from .engine import matching
@@ -137,6 +138,11 @@ def cmd_close_run(args):
     ledger.rebuild_merchant_history(conn, cfg.client, through_month=month)
     stats = cat_pipeline.categorize_month(conn, cfg, month, use_llm=not args.no_llm)
     print(f"categorization: {stats}")
+
+    # 3b. event-window overrides (calendar context: Summit weeks, launches)
+    ev = events.apply_event_windows(conn, cfg, month)
+    if ev["overridden"]:
+        print(f"event windows: {ev['overridden']} lines recoded to event categories")
 
     # 4. artifacts
     lines = ledger.lines_for_month(conn, cfg.client, month)

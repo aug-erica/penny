@@ -41,3 +41,26 @@ billable:
   # it hits client invoices and the ~10% T&E cap per SOW.
   always_flag: true
   billable_categories: ["Billable Expense"]
+
+# Event windows encode calendar context the card feed can't carry: during an
+# in-person/Summit week or a launch push, ordinary food/travel/local spend is
+# coded to the event, not to Groceries/Travel. Supplied prospectively by the
+# reviewer each month (ask Purvi/Erica for the month's in-person weeks before
+# a pre-fill run). A window only overrides categories in its `absorbs` list, so
+# software renewals, subscriptions, etc. that fall in the window are untouched.
+# `recur: fridays` marks a standing weekly pattern rather than a date range.
+event_windows:
+  - name: "May Summit / In-Person Week"
+    start: "2026-05-04"
+    end: "2026-05-09"
+    coa_line: "Team Culture:Summit & In Person Weeks"
+    absorbs: ["Groceries & Meals", "General Travel", "Billable Expense",
+              "Sales - Client Engagement & Lead Development", "Non-billable Expenses",
+              "Sales, Speaking & Conferences"]
+  - name: "Friday team lunch"
+    recur: "fridays"
+    coa_line: "Team Culture:Friday Lunch"
+    absorbs: ["Groceries & Meals"]
+    # Recurring lunch is NY-office food only; keep it low-confidence so the
+    # reviewer confirms (a Friday client dinner shouldn't silently convert).
+    confidence: "medium"
