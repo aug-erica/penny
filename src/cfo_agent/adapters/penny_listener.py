@@ -41,8 +41,12 @@ def run(client_name: str, month: str):
             return
         smc.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
         e = req.payload.get("event", {})
+        subtype = e.get("subtype")
+        # Process normal DMs and file uploads (subtype 'file_share'); skip edits,
+        # joins, and other subtypes, bot messages, and Penny's own messages.
         if (e.get("type") != "message" or e.get("channel_type") != "im"
-                or e.get("bot_id") or e.get("subtype") or e.get("user") == me):
+                or e.get("bot_id") or e.get("user") == me
+                or (subtype and subtype != "file_share")):
             return
         uid = e.get("user")
         cardholder = slack_users.get(uid)
