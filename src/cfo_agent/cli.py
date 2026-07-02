@@ -307,6 +307,54 @@ def cmd_notify_build(args):
     return 0
 
 
+def cmd_notify_send(args):
+    """Send each open pal their expense DM AS Penny. Default targets pals who
+    haven't responded and still have open items; --only NAME targets one.
+    Dry-run unless --send."""
+    import yaml
+    from .config import CLIENTS_DIR
+    from .engine import dm_assemble, digest as digest_mod
+    from .adapters.slack_client import PennySlack
+
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    bot = cfg.raw.get("bot", {})
+    id_by_pal = {v: k for k, v in bot.get("slack_users", {}).items()}
+    proj_data = yaml.safe_load((CLIENTS_DIR / cfg.client / "active_projects.yaml").read_text())
+    projects = (proj_data.get(args.month, {}) or {}).get("projects", [])
+
+    lines = ledger.lines_for_month(conn, cfg.client, args.month)
+    by_pal = {}
+    for l in lines:
+        if l["source"] != "card_feed" and not l.get("reimbursable"):
+            continue
+        by_pal.setdefault(l.get("cardholder") or "(unknown)", []).append(l)
+
+    penny = PennySlack() if args.send else None
+    sent = 0
+    for pal, pal_lines in sorted(by_pal.items()):
+        if args.only and args.only.lower() not in pal.lower():
+            continue
+        st = digest_mod._pal_status(pal_lines)
+        if not args.only and not (st["open"] > 0 and not st["responded"]):
+            continue   # default: only un-responded pals with open items
+        uid = id_by_pal.get(pal)
+        if not uid:
+            print(f"  [skip] no Slack id for {pal}")
+            continue
+        dm = dm_assemble.assemble_dm(pal.split()[0], pal_lines, projects,
+                                     bot.get("name", "Penny"))
+        if args.send:
+            penny.send_dm(uid, dm)
+            print(f"  sent → {pal}")
+        else:
+            print(f"  would send → {pal} ({st['open']} open)")
+        sent += 1
+    print(f"\n{'sent' if args.send else 'would send'} {sent} DM(s)"
+          + ("" if args.send else " — add --send to actually send"))
+    return 0
+
+
 def cmd_notify_collect(args):
     """Apply a pal's reply (text) to the ledger via the shared processor —
     billable/project + category corrections + rules — and print the confirm-back.
@@ -507,6 +555,12 @@ def main(argv=None):
     nb.add_argument("--month", required=True)
     nb.add_argument("--only", default=None, help="only this cardholder (substring match)")
     nb.set_defaults(fn=cmd_notify_build)
+    ns = nsub.add_parser("send")
+    ns.add_argument("--client", required=True)
+    ns.add_argument("--month", required=True)
+    ns.add_argument("--only", default=None, help="one cardholder (substring)")
+    ns.add_argument("--send", action="store_true", help="actually send via Penny (else dry-run)")
+    ns.set_defaults(fn=cmd_notify_send)
     nc = nsub.add_parser("collect")
     nc.add_argument("--client", required=True)
     nc.add_argument("--month", required=True)
