@@ -404,6 +404,24 @@ def cmd_notify_receipt(args):
     return 0
 
 
+def cmd_qbo_smoke(args):
+    """Prove the QuickBooks connection: refresh the token and list credit-card
+    accounts. Needs QBO_CLIENT_ID/SECRET/REFRESH_TOKEN/REALM_ID in .env."""
+    from .adapters.card_feed.qbo_feed import QBOFeed, QBOError
+    feed = QBOFeed()
+    try:
+        feed._refresh_access_token()
+        print(f"OK — token refreshed ({env('QBO_ENV') or 'sandbox'}), realm {feed.realm_id}")
+        accts = feed.credit_card_accounts()
+        print(f"credit-card accounts visible ({len(accts)}):")
+        for a in accts:
+            print(f"  id {a['id']:>6}  {a['name']}")
+    except QBOError as e:
+        print(f"QBO smoke failed: {e}")
+        return 1
+    return 0
+
+
 def cmd_vault_smoke(args):
     cfg = load_client(args.client)
     vault = _vault(cfg)
@@ -497,6 +515,11 @@ def main(argv=None):
     s = vsub.add_parser("smoke")
     s.add_argument("--client", required=True)
     s.set_defaults(fn=cmd_vault_smoke)
+
+    qbo = sub.add_parser("qbo")
+    qsub = qbo.add_subparsers(dest="subcmd", required=True)
+    qs = qsub.add_parser("smoke")
+    qs.set_defaults(fn=cmd_qbo_smoke)
 
     args = p.parse_args(argv)
     sys.exit(args.fn(args))
