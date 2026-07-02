@@ -112,34 +112,51 @@ class QBOFeed:
 
     # -- adapter interface ---------------------------------------------------
     def fetch_transactions(self, month_start: date, month_end: date) -> List[CardTxn]:
-        accts = ([{"id": self.account_ref, "name": ""}] if self.account_ref
-                 else self.credit_card_accounts())
-        out = []
-        for a in accts:
-            sql = (f"SELECT * FROM Purchase WHERE AccountRef = '{a['id']}' "
-                   f"AND TxnDate >= '{month_start}' AND TxnDate <= '{month_end}' "
-                   f"AND PaymentType = 'CreditCard' MAXRESULTS 1000")
-            for p in self.query(sql):
-                out.append(self._to_cardtxn(p, a["id"]))
+        # Purchase.AccountRef isn't queryable in WHERE, so page through all
+        # purchases in the date range and keep those on our credit-card accounts.
+        cc_ids = {self.account_ref} if self.account_ref else {
+            a["id"] for a in self.credit_card_accounts()}
+        out, start, page = [], 1, 1000
+        while True:
+            sql = (f"SELECT * FROM Purchase WHERE TxnDate >= '{month_start}' "
+                   f"AND TxnDate <= '{month_end}' ORDER BY TxnDate "
+                   f"STARTPOSITION {start} MAXRESULTS {page}")
+            batch = self.query(sql)
+            for p in batch:
+                if (p.get("AccountRef") or {}).get("value") in cc_ids:
+                    out.append(self._to_cardtxn(p, (p["AccountRef"])["value"]))
+            if len(batch) < page:
+                break
+            start += page
         return out
+
+    @staticmethod
+    def _cardholder_from_account(account_name: str) -> str:
+        # "Chase Business Card (8303):Chase Business Card - P. Patel (6761)" -> "P. Patel"
+        if account_name and " - " in account_name:
+            return account_name.rsplit(" - ", 1)[1].split(" (")[0].strip()
+        return None  # parent/main card (8303) has no sub-name
 
     @staticmethod
     def _to_cardtxn(p: dict, account_id: str) -> CardTxn:
         cents = round(float(p.get("TotalAmt", 0)) * 100)
         if p.get("Credit"):          # a credit/refund on the card
             cents = -cents
-        # Merchant field is best-effort until confirmed on real fed data: prefer
-        # the payee (EntityRef), fall back to the memo / first line description.
-        merchant = ((p.get("EntityRef") or {}).get("name")
+        # Verified against real QBO data (2026-07-02): the merchant lives in the
+        # first expense line's Description; EntityRef is a generic vendor
+        # ("Credit Card Misc."), so it is NOT the merchant. Fall back to memo.
+        line0 = (p.get("Line") or [{}])[0]
+        merchant = (line0.get("Description")
                     or p.get("PrivateNote")
-                    or (p.get("Line", [{}])[0].get("Description") if p.get("Line") else "")
+                    or (p.get("EntityRef") or {}).get("name")
                     or "UNKNOWN")
+        acct = (p.get("AccountRef") or {})
         return CardTxn(
             txn_date=datetime.strptime(p["TxnDate"], "%Y-%m-%d").date(),
             merchant_raw=merchant.strip(),
             amount_cents=cents,
-            cardholder=None,          # QBO posts to the account; cardholder not on the txn
-            statement_ref=f"qbo:{account_id}",
+            cardholder=QBOFeed._cardholder_from_account(acct.get("name", "")),
+            statement_ref=f"qbo:{acct.get('value') or account_id}",
         )
 
     def verify(self) -> List[StatementCheck]:
