@@ -14,6 +14,8 @@ bot:
   handle: "@Penny"
   digest_channel: "CR29V8J06"      # #finance — daily digest, first week of month only
   digest_days: 7                    # post the digest only for days 1–7 of the month
+  # Admins who can file/act on behalf of another pal (by naming them in the DM).
+  admins: ["U094H9WBE", "U09MANP29UP"]   # Erica, Purvi
   # Slack user id -> cardholder, so the listener maps a DM sender to their charges.
   slack_users:
     U094TAG23: "Mike Arauz"

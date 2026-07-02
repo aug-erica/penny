@@ -29,9 +29,23 @@ def _log(msg):
 def run(client_name: str, month: str):
     cfg = load_client(client_name)
     db_path = RUNS_LOCAL / cfg.client / "ledger.sqlite3"
-    slack_users = cfg.raw.get("bot", {}).get("slack_users", {})
+    bot = cfg.raw.get("bot", {})
+    slack_users = bot.get("slack_users", {})
+    admins = set(bot.get("admins", []))
     penny = PennySlack()
     me = penny.auth_test()["user_id"]
+
+    def resolve_cardholder(sender_uid, text):
+        """Sender's own DM = their charges. But an admin naming another pal in the
+        message files on that pal's behalf."""
+        sender = slack_users.get(sender_uid)
+        if sender_uid in admins and text:
+            tl = text.lower()
+            named = {c for c in slack_users.values() if c != sender
+                     and (c.split()[0].lower() in tl or c.split()[-1].lower() in tl)}
+            if len(named) == 1:
+                return named.pop()
+        return sender
 
     sm = SocketModeClient(app_token=env("SLACK_APP_TOKEN"),
                           web_client=WebClient(token=env("SLACK_BOT_TOKEN")))
@@ -49,13 +63,14 @@ def run(client_name: str, month: str):
                 or (subtype and subtype != "file_share")):
             return
         uid = e.get("user")
-        cardholder = slack_users.get(uid)
+        text = e.get("text", "") or ""
+        cardholder = resolve_cardholder(uid, text)
         if not cardholder:
             _log(f"[skip] DM from unmapped user {uid}")
             return
-        text = e.get("text", "") or ""
         file_ids = [f["id"] for f in e.get("files", []) if f.get("id")]
-        _log(f"[reply] {cardholder}: {text[:70]!r} + {len(file_ids)} file(s)")
+        on_behalf = " (on behalf, by admin)" if slack_users.get(uid) != cardholder else ""
+        _log(f"[reply] {cardholder}{on_behalf}: {text[:70]!r} + {len(file_ids)} file(s)")
         try:
             conn = ledger.open_db(db_path)   # fresh connection on this worker thread
             res = reply_flow.process_pal_reply(conn, cfg, cardholder, text, month,

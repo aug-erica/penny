@@ -32,5 +32,12 @@ def store_file(cfg, month: str, pal: str, line: dict, src_path: Path) -> Path:
     name = (f"{_slug(pal)}__{_slug(line['merchant_raw'])}__"
             f"{line['amount_cents']/100:.2f}__{line['txn_date']}{ext}")
     dest = receipts_dir(cfg, month) / name
+    # Never overwrite an existing receipt (e.g. multiple unmatched files).
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        i = 2
+        while dest.exists():
+            dest = dest.with_name(f"{stem}__{i}{suffix}")
+            i += 1
     shutil.copyfile(src_path, dest)
     return dest
