@@ -104,7 +104,9 @@ class QBOFeed:
         return []
 
     def credit_card_accounts(self) -> list:
-        rows = self.query("SELECT * FROM Account WHERE AccountType = 'CreditCard'")
+        # NB: Account.AccountType enum is "Credit Card" (with space); only
+        # Purchase.PaymentType uses "CreditCard" (no space). Different enums.
+        rows = self.query("SELECT * FROM Account WHERE AccountType = 'Credit Card'")
         return [{"id": a["Id"], "name": a.get("FullyQualifiedName") or a.get("Name")}
                 for a in rows]
 
