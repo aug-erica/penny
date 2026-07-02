@@ -107,7 +107,10 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
     untagged = [l for l in candidates
                 if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
     needed = [l for l in charges if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
-    missing_receipts = [l for l in needed if l.get("receipt_status") != "received"]
+    # A pal who replied with a file counts as "in hand" (stored OR referenced),
+    # even if we haven't retained the file to a vault yet — don't nag them.
+    have = ("stored", "referenced", "received")
+    missing_receipts = [l for l in needed if l.get("receipt_status") not in have]
 
     recategorized = [l for l in charges if l.get("proposed_by") == "reviewer"]
 

@@ -72,5 +72,9 @@ merchant_rules:
   kind: exact
   coa_line: Professional Development
   source: reviewer-correction
+- match: CASA MONO
+  kind: exact
+  coa_line: Sales - Client Engagement & Lead Development
+  source: reviewer-correction
 keyword_rules: []
 cardholder_defaults: {}
