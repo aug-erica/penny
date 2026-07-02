@@ -3,7 +3,7 @@ week of the month. Summarizes where each pal stands: responded or not, and what
 they still owe (a project call, a receipt, or a reviewer decision)."""
 from __future__ import annotations
 
-from .dm_assemble import BILLABLE_CANDIDATE, RECEIPT_THRESHOLD_CENTS
+from .dm_assemble import BILLABLE_CANDIDATE, _receipt_needed
 from . import ledger
 
 _HAVE_RECEIPT = ("stored", "referenced", "received")
@@ -15,8 +15,7 @@ def _pal_status(charges: list) -> dict:
     # already declared not-billable by the pal.
     untagged = [c for c in charges if c.get("proposed_coa_line") in BILLABLE_CANDIDATE
                 and not c.get("project") and c.get("billable") != 0]
-    needed = [c for c in charges if c.get("billable")
-              or c["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
+    needed = _receipt_needed(charges)
     missing_receipts = [c for c in needed if c.get("receipt_status") not in _HAVE_RECEIPT]
     needs_reviewer = [c for c in charges if not c.get("proposed_coa_line")]
     # "Responded" = signals ONLY a human reply produces: a recategorization, a

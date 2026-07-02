@@ -11,12 +11,15 @@ from __future__ import annotations
 
 from . import ledger
 
-RECEIPT_THRESHOLD_CENTS = 7500
+RECEIPT_THRESHOLD_CENTS = 10000   # policy: receipts required over $100 (Purvi, July 2)
 
 
 def receipt_needed(charges: list) -> list:
+    # Over the threshold, OR confirmed-billable-to-a-project (client requirement).
+    # NOT the LLM's billable guess alone — that over-asked for small receipts.
     return [c for c in charges if c["status"] != "excluded" and c["amount_cents"] > 0
-            and (c.get("billable") or c["amount_cents"] >= RECEIPT_THRESHOLD_CENTS)]
+            and (c["amount_cents"] >= RECEIPT_THRESHOLD_CENTS
+                 or (c.get("billable") and c.get("project")))]
 
 
 def match_by_amount(charges: list, amount_cents: int) -> list:

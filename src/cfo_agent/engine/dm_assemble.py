@@ -12,7 +12,13 @@ from datetime import date
 # Categories that might be re-billed to a project — the only ones we ask about.
 BILLABLE_CANDIDATE = {"Billable Expense", "General Travel"}
 TRIP_GAP_DAYS = 4          # a >4-day gap starts a new "trip"
-RECEIPT_THRESHOLD_CENTS = 7500   # non-billable receipts required above this
+RECEIPT_THRESHOLD_CENTS = 10000   # receipts required over $100 (policy, Purvi July 2)
+
+
+def _receipt_needed(charges: list) -> list:
+    # Over threshold OR confirmed-billable-to-a-project — not the LLM's guess.
+    return [c for c in charges if c.get("billable") and c.get("project")
+            or c["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
 
 
 def _money(cents: int) -> str:
@@ -46,22 +52,28 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     total = sum(l["amount_cents"] for l in charges)
     billable_candidates = [l for l in charges
                            if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
-    receipts_needed = [l for l in charges
-                       if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
+    receipts_needed = _receipt_needed(charges)
 
     out = [f"👋 Hey {pal_first} — it's {bot_name}, August's expense bot. I've pulled and "
            f"categorized your {len(charges)} August-card charges for June ({_money(total)}). "
-           f"Here's what I've got — give it a look, then a couple quick things below."]
+           f"Here's what I've got, grouped by category so it's easy to skim — then a "
+           f"couple quick things below."]
 
-    # The full categorized list, so pals can see (and trust) every call Penny made.
-    out.append("\n*Your June expenses, as I categorized them:*")
-    out.append("| Date | Merchant | Amount | Category |")
-    out.append("|---|---|---:|---|")
-    for l in sorted(charges, key=lambda l: l["txn_date"]):
-        merch = _merchant(l["merchant_raw"])
-        merch = merch[:28] + "…" if len(merch) > 29 else merch
-        out.append(f"| {l['txn_date'][5:]} | {merch} | {_money(l['amount_cents'])} "
-                   f"| {l.get('proposed_coa_line') or '—'} |")
+    # Grouped by category with subtotals (reviewer feedback: easier to skim/verify).
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for l in charges:
+        groups[l.get("proposed_coa_line") or "(uncategorized)"].append(l)
+    for cat in sorted(groups):
+        rows = sorted(groups[cat], key=lambda l: l["txn_date"])
+        sub = sum(l["amount_cents"] for l in rows)
+        out.append(f"\n*{cat}* — {len(rows)} charge(s), {_money(sub)}")
+        out.append("| Date | Merchant | Amount |")
+        out.append("|---|---|---:|")
+        for l in rows:
+            merch = _merchant(l["merchant_raw"])
+            merch = merch[:30] + "…" if len(merch) > 31 else merch
+            out.append(f"| {l['txn_date'][5:]} | {merch} | {_money(l['amount_cents'])} |")
 
     marks = ["1️⃣", "2️⃣", "3️⃣"]
     step = iter(marks)
@@ -106,7 +118,7 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
     not_billable = [l for l in candidates if l.get("billable") == 0]
     untagged = [l for l in candidates
                 if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
-    needed = [l for l in charges if l.get("billable") or l["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
+    needed = _receipt_needed(charges)
     # A pal who replied with a file counts as "in hand" (stored OR referenced),
     # even if we haven't retained the file to a vault yet — don't nag them.
     have = ("stored", "referenced", "received")

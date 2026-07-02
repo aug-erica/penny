@@ -85,7 +85,15 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
 
     fresh = _pal_charges(conn, cfg.client, month, cardholder)
     bot = cfg.raw.get("bot", {}).get("name", "the expense bot")
-    result["confirm_back"] = dm_assemble.confirm_back(cardholder.split()[0], fresh, bot)
+    cb = dm_assemble.confirm_back(cardholder.split()[0], fresh, bot)
+    made = result["decisions"] + result["recats"] + result["receipts"]
+    if made == 0:
+        # Be explicit when nothing was applied (reviewer feedback: "is she correcting?").
+        cb = ("_(I didn't catch a specific change in that message, so I haven't recorded "
+              "anything yet. Tell me a category, \"not billable\", or attach a receipt for "
+              "a charge and I'll update it. For a spreadsheet of corrections, it's easier "
+              "to use the review workbook.)_\n\n") + cb
+    result["confirm_back"] = cb
     return result
 
 
