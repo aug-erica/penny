@@ -414,6 +414,35 @@ def cmd_notify_receipt(args):
     return 0
 
 
+def cmd_notify_digest(args):
+    """Post the close status to #finance. First week of the month only unless
+    --force. --post actually sends via Penny; otherwise it just prints."""
+    from datetime import date
+    from .engine import digest as digest_mod
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    bot = cfg.raw.get("bot", {})
+    today = date.today()
+    day = today.day
+    text = digest_mod.build_digest(conn, cfg, args.month, day=day)
+    print(text)
+    if not args.post:
+        print("\n(dry run — add --post to send to #finance)")
+        return 0
+    if day > int(bot.get("digest_days", 7)) and not args.force:
+        print(f"\nday {day} is past the first week — skipping post (use --force to override).")
+        return 0
+    from .adapters.slack_client import PennySlack, SlackError
+    try:
+        PennySlack()._post("chat.postMessage", channel=bot["digest_channel"], text=text)
+        print(f"\nposted to #finance ({bot['digest_channel']})")
+    except SlackError as e:
+        print(f"\npost failed: {e}"
+              + (" — invite @Penny to #finance first" if "not_in_channel" in str(e) else ""))
+        return 1
+    return 0
+
+
 def cmd_penny_smoke(args):
     """Confirm Penny's bot works; optionally send a test DM to an email."""
     from .adapters.slack_client import PennySlack
@@ -534,6 +563,12 @@ def main(argv=None):
     nr.add_argument("--slack-file", default=None, help="Slack file id — Penny downloads + stores it")
     nr.add_argument("--link", default=None, help="Slack file ref (referenced only, not retained)")
     nr.set_defaults(fn=cmd_notify_receipt)
+    nd = nsub.add_parser("digest")
+    nd.add_argument("--client", required=True)
+    nd.add_argument("--month", required=True)
+    nd.add_argument("--post", action="store_true", help="post to #finance (else dry-run)")
+    nd.add_argument("--force", action="store_true", help="post even past the first week")
+    nd.set_defaults(fn=cmd_notify_digest)
 
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)

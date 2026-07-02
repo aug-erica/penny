@@ -12,6 +12,8 @@ reviewer:
 bot:
   name: "Penny"
   handle: "@Penny"
+  digest_channel: "CR29V8J06"      # #finance — daily digest, first week of month only
+  digest_days: 7                    # post the digest only for days 1–7 of the month
 
 data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Shared drives/August Brain/06_Operations/CFO Agent"
 close_data_dir: "2026 Month End Close"   # relative to data_root
