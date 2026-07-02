@@ -393,14 +393,38 @@ def cmd_notify_receipt(args):
     if len(matches) > 1:
         print(f"ambiguous — {len(matches)} charges at ${args.amount}; using the first:")
     m = matches[0]
-    if args.file:
+    if args.slack_file:
+        import tempfile
+        from .adapters.slack_client import PennySlack
+        tmp = Path(tempfile.mktemp())
+        PennySlack().download_file(args.slack_file, tmp)
+        dest = receipt_store.store_file(cfg, args.month, args.pal, m, tmp)
+        tmp.unlink(missing_ok=True)
+        ledger.set_receipt_status(conn, m["id"], "stored", str(dest))
+        print(f"  receipt STORED (fetched from Slack via Penny): {m['merchant_raw'][:30]} "
+              f"${cents/100:.2f} → {dest}")
+    elif args.file:
         dest = receipt_store.store_file(cfg, args.month, args.pal, m, Path(args.file))
         ledger.set_receipt_status(conn, m["id"], "stored", str(dest))
         print(f"  receipt STORED: {m['merchant_raw'][:30]} ${cents/100:.2f} → {dest}")
     else:
         ledger.set_receipt_status(conn, m["id"], "referenced", args.link)
         print(f"  receipt REFERENCED only (file NOT retained): {m['merchant_raw'][:30]} "
-              f"${cents/100:.2f} — needs the @Penny token to fetch {args.link}")
+              f"${cents/100:.2f} — needs Penny to be in the conversation to fetch {args.link}")
+    return 0
+
+
+def cmd_penny_smoke(args):
+    """Confirm Penny's bot works; optionally send a test DM to an email."""
+    from .adapters.slack_client import PennySlack
+    p = PennySlack()
+    who = p.auth_test()
+    print(f"OK — Penny is '{who['user']}' (id {who['user_id']}) in {who['team']}")
+    if args.dm:
+        uid = p.user_id_by_email(args.dm)
+        p.send_dm(uid, args.message or "👋 Hi — it's Penny, August's expense bot, "
+                  "now sending from my own account. (Test message.)")
+        print(f"  sent test DM to {args.dm}")
     return 0
 
 
@@ -507,6 +531,7 @@ def main(argv=None):
     nr.add_argument("--pal", required=True)
     nr.add_argument("--amount", required=True, help="receipt amount in dollars")
     nr.add_argument("--file", default=None, help="local path to the receipt file (stored in repo)")
+    nr.add_argument("--slack-file", default=None, help="Slack file id — Penny downloads + stores it")
     nr.add_argument("--link", default=None, help="Slack file ref (referenced only, not retained)")
     nr.set_defaults(fn=cmd_notify_receipt)
 
@@ -520,6 +545,13 @@ def main(argv=None):
     qsub = qbo.add_subparsers(dest="subcmd", required=True)
     qs = qsub.add_parser("smoke")
     qs.set_defaults(fn=cmd_qbo_smoke)
+
+    penny = sub.add_parser("penny")
+    psub = penny.add_subparsers(dest="subcmd", required=True)
+    ps = psub.add_parser("smoke")
+    ps.add_argument("--dm", default=None, help="send a test DM to this email")
+    ps.add_argument("--message", default=None)
+    ps.set_defaults(fn=cmd_penny_smoke)
 
     args = p.parse_args(argv)
     sys.exit(args.fn(args))
