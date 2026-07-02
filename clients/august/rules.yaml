@@ -76,5 +76,9 @@ merchant_rules:
   kind: exact
   coa_line: Sales - Client Engagement & Lead Development
   source: reviewer-correction
+- match: LYFT *1 RIDE
+  kind: exact
+  coa_line: Sales, Speaking & Conferences
+  source: reviewer-correction
 keyword_rules: []
 cardholder_defaults: {}
