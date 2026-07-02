@@ -308,71 +308,24 @@ def cmd_notify_build(args):
 
 
 def cmd_notify_collect(args):
-    """Apply a pal's reply: interpret which charges are billable + to which
-    project, and write it back to the ledger. Reply text via --reply or
-    --reply-file (Slack thread reading is done via the connector and piped in)."""
-    import yaml
-    from .config import CLIENTS_DIR
-    from .engine import reply_parse
-
+    """Apply a pal's reply (text) to the ledger via the shared processor —
+    billable/project + category corrections + rules — and print the confirm-back.
+    Same code path Penny's live listener uses."""
+    from .engine import reply_flow
     cfg = load_client(args.client)
     conn = _db(cfg)
     reply = args.reply or (Path(args.reply_file).read_text() if args.reply_file else "")
     if not reply.strip():
         print("no reply text provided (--reply or --reply-file)")
         return 1
-
-    proj_data = yaml.safe_load((CLIENTS_DIR / cfg.client / "active_projects.yaml").read_text())
-    projects = [p["project"] for p in (proj_data.get(args.month, {}) or {}).get("projects", [])]
-
-    lines = ledger.lines_for_month(conn, cfg.client, args.month)
-    charges = [l for l in lines
-               if (l.get("cardholder") or "").lower().find(args.pal.lower()) >= 0
-               and l["status"] != "excluded" and l["amount_cents"] > 0]
-    if not charges:
-        print(f"no June charges found for cardholder matching '{args.pal}'")
-        return 1
-
-    by_ext = {c["external_id"]: c for c in charges}
-    decisions = reply_parse.interpret_reply(cfg.client, reply, charges, projects)
-    for d in decisions:
-        line = by_ext.get(d["external_id"])
-        if not line:
-            continue
-        ledger.set_billable_project(conn, line["id"], 1 if d["billable"] else 0,
-                                    d["project"])
-        tag = f"billable → {d['project']}" if d["billable"] else "not billable"
-        print(f"  {d['merchant'][:34]:34s} {tag}")
-
-    # Category corrections in the reply — apply + capture as a rule (flywheel).
-    from .engine.normalize import normalize_merchant
-    recats = reply_parse.interpret_recategorizations(cfg.client, reply, charges, cfg.coa_lines)
-    new_rules = {}
-    for r in recats:
-        line = by_ext.get(r["external_id"])
-        if not line:
-            continue
-        ledger.set_proposal(conn, line["id"], r["new_category"], "reviewer", "high",
-                            f"recategorized by {args.pal.split()[0]}: {r['why']}".strip(),
-                            status="flagged")
-        new_rules[normalize_merchant(line["merchant_raw"])] = r["new_category"]
-        print(f"  {r['merchant'][:34]:34s} recategorized {r['old']} → {r['new_category']}")
-    written = _merge_rules(cfg, new_rules)
-
-    total = len(decisions) + len(recats)
-    if not total:
+    res = reply_flow.process_pal_reply(conn, cfg, args.pal, reply, args.month)
+    if not (res["decisions"] or res["recats"]):
         print("couldn't interpret the reply into changes (nothing changed).")
-        return 0
-    print(f"\napplied {len(decisions)} billable/project + {len(recats)} recategorization(s)"
-          + (f"; wrote {written} rule(s)" if written else "") + f" from {args.pal}'s reply.")
-
-    # Confirm-back: echo the full recorded state so the pal can catch a miss.
-    from .engine import dm_assemble
-    bot = cfg.raw.get("bot", {}).get("name", "the expense bot")
-    fresh = [l for l in ledger.lines_for_month(conn, cfg.client, args.month)
-             if (l.get("cardholder") or "").lower().find(args.pal.lower()) >= 0]
+    else:
+        print(f"applied {res['decisions']} billable/project + {res['recats']} "
+              f"recategorization(s)" + (f"; wrote {res['rules']} rule(s)" if res['rules'] else ""))
     print("\n----- confirm-back message -----")
-    print(dm_assemble.confirm_back(args.pal.split()[0], fresh, bot))
+    print(res["confirm_back"])
     return 0
 
 
@@ -454,6 +407,13 @@ def cmd_penny_smoke(args):
         p.send_dm(uid, args.message or "👋 Hi — it's Penny, August's expense bot, "
                   "now sending from my own account. (Test message.)")
         print(f"  sent test DM to {args.dm}")
+    return 0
+
+
+def cmd_penny_listen(args):
+    """Start Penny's live Socket Mode listener — processes pal DMs autonomously."""
+    from .adapters import penny_listener
+    penny_listener.run(args.client, args.month)
     return 0
 
 
@@ -587,6 +547,10 @@ def main(argv=None):
     ps.add_argument("--dm", default=None, help="send a test DM to this email")
     ps.add_argument("--message", default=None)
     ps.set_defaults(fn=cmd_penny_smoke)
+    pl = psub.add_parser("listen")
+    pl.add_argument("--client", required=True)
+    pl.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
+    pl.set_defaults(fn=cmd_penny_listen)
 
     args = p.parse_args(argv)
     sys.exit(args.fn(args))
