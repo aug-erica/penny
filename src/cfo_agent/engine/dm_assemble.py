@@ -110,6 +110,7 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
     # A pal who replied with a file counts as "in hand" (stored OR referenced),
     # even if we haven't retained the file to a vault yet — don't nag them.
     have = ("stored", "referenced", "received")
+    filed = [l for l in needed if l.get("receipt_status") == "stored"]
     missing_receipts = [l for l in needed if l.get("receipt_status") not in have]
 
     recategorized = [l for l in charges if l.get("proposed_by") == "reviewer"]
@@ -129,11 +130,15 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
         out.append("\n❓ *Still need a call on these* — billable to which project, or not?")
         for l in untagged:
             out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['txn_date'][5:]})")
+    if filed:
+        out.append("\n📎 *Receipts filed:*")
+        for l in filed:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ✓ (saved to the repository)")
     if missing_receipts:
         out.append("\n📎 *Still need receipts for:*")
         for l in missing_receipts:
             out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])}")
-    elif needed:
+    elif needed and not filed:
         out.append("\n📎 Receipts: all in — thank you!")
     if not untagged and not missing_receipts:
         out.append("\nYou're all set. 🎉 Nothing else needed.")

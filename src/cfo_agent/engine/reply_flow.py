@@ -12,7 +12,12 @@ from . import dm_assemble, ledger, receipt_store, receipts, reply_parse
 from .normalize import normalize_merchant
 from .rules_io import merge_rules
 
-_AMOUNT = re.compile(r"\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2})")
+# Amounts with or without cents: $1,350 / $1,350.00 / 266.83
+_AMOUNT = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+(?:\.\d{2})?)")
+
+
+def _to_cents(s: str) -> int:
+    return round(float(s.replace(",", "")) * 100)
 
 
 def _pal_charges(conn, client, month, cardholder):
@@ -50,31 +55,31 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     result["rules"] = merge_rules(cfg.client, new_rules)
 
     # 3. receipts — download + store; link to a charge by amount when possible
+    result["filed"] = []          # (merchant, amount_cents) linked this reply
+    result["unlinked"] = 0
     if slack and file_ids:
-        fresh = _pal_charges(conn, cfg.client, month, cardholder)
-        amounts_in_text = {round(float(a.replace(",", "")) * 100) for a in _AMOUNT.findall(text)}
-        needed = receipts.receipt_needed(fresh)
+        amounts_in_text = {_to_cents(a) for a in _AMOUNT.findall(text)}
         for fid in file_ids:
             tmp = Path(tempfile.mktemp())
             try:
                 slack.download_file(fid, tmp)
             except Exception:
+                tmp.unlink(missing_ok=True)
                 continue
-            # Prefer an amount named in the text; else the sole outstanding need.
-            target = None
-            cand = [c for c in needed if c["amount_cents"] in amounts_in_text
-                    and c.get("receipt_status") != "stored"]
-            if cand:
-                target = cand[0]
-            elif len([c for c in needed if c.get("receipt_status") != "stored"]) == 1:
-                target = [c for c in needed if c.get("receipt_status") != "stored"][0]
+            fresh = _pal_charges(conn, cfg.client, month, cardholder)
+            needed = [c for c in receipts.receipt_needed(fresh)
+                      if c.get("receipt_status") != "stored"]
+            # 1) amount named in the message; 2) sole outstanding need.
+            cand = [c for c in needed if c["amount_cents"] in amounts_in_text]
+            target = cand[0] if cand else (needed[0] if len(needed) == 1 else None)
             if target:
                 dest = receipt_store.store_file(cfg, month, cardholder, target, tmp)
                 ledger.set_receipt_status(conn, target["id"], "stored", str(dest))
+                result["filed"].append((target["merchant_raw"], target["amount_cents"]))
             else:
-                # Store unlinked (retention) under the pal's folder.
-                fake = {"merchant_raw": "receipt", "amount_cents": 0, "txn_date": month}
+                fake = {"merchant_raw": "receipt-unmatched", "amount_cents": 0, "txn_date": month}
                 receipt_store.store_file(cfg, month, cardholder, fake, tmp)
+                result["unlinked"] += 1
             tmp.unlink(missing_ok=True)
             result["receipts"] += 1
 
