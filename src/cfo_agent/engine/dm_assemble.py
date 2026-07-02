@@ -53,7 +53,7 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
            f"categorized your {len(charges)} August-card charges for June ({_money(total)}). "
            f"Here's what I've got — give it a look, then a couple quick things below."]
 
-    # The full categorized list, so pals can see (and trust) every call Flo made.
+    # The full categorized list, so pals can see (and trust) every call Penny made.
     out.append("\n*Your June expenses, as I categorized them:*")
     out.append("| Date | Merchant | Amount | Category |")
     out.append("|---|---|---:|---|")

@@ -5,7 +5,7 @@ audit trail) can find them: <month>/<pal>__<merchant>__<amount>__<date>.<ext>.
 The ledger's receipt_link points at the stored file; receipt_status is:
   - 'stored'      the file is in the repository (real, retained)
   - 'referenced'  we only have a Slack file id, not the bytes (NOT retained —
-                  needs the @Flo bot token with files:read to fetch, or the pal
+                  needs the @Penny bot token with files:read to fetch, or the pal
                   to drop the file where we can read it)
 Only 'stored' counts as a real, audit-safe receipt.
 """

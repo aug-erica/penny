@@ -10,8 +10,8 @@ reviewer:
 # The expense bot's Slack identity (dedicated bot user). Used in DM copy + as
 # the sender once the Slack app is created and installed.
 bot:
-  name: "Flo"
-  handle: "@Flo"
+  name: "Penny"
+  handle: "@Penny"
 
 data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Shared drives/August Brain/06_Operations/CFO Agent"
 close_data_dir: "2026 Month End Close"   # relative to data_root

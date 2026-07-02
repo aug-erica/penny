@@ -400,7 +400,7 @@ def cmd_notify_receipt(args):
     else:
         ledger.set_receipt_status(conn, m["id"], "referenced", args.link)
         print(f"  receipt REFERENCED only (file NOT retained): {m['merchant_raw'][:30]} "
-              f"${cents/100:.2f} — needs the @Flo token to fetch {args.link}")
+              f"${cents/100:.2f} — needs the @Penny token to fetch {args.link}")
     return 0
 
 
