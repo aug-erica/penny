@@ -60,9 +60,8 @@ class Conn:
     def executescript(self, script: str):
         if self.is_pg:
             cur = self._raw.cursor()
-            for stmt in (s.strip() for s in script.split(";")):
-                if stmt:
-                    cur.execute(stmt)
+            for stmt in pg_statements(script):
+                cur.execute(stmt)
             return
         self._raw.executescript(script)
 
@@ -71,6 +70,15 @@ class Conn:
 
     def close(self):
         self._raw.close()
+
+
+def pg_statements(script: str) -> list:
+    """Split a DDL script into statements for Postgres (which, unlike SQLite's
+    executescript, gets them one at a time). `--` comment lines are stripped
+    FIRST: a semicolon inside a comment would otherwise split mid-comment and
+    execute the remainder as garbage SQL (this took Penny down on July 6)."""
+    sql = "\n".join(l for l in script.splitlines() if not l.lstrip().startswith("--"))
+    return [s.strip() for s in sql.split(";") if s.strip()]
 
 
 def connect(path) -> Conn:

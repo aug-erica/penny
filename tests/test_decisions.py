@@ -163,6 +163,17 @@ def test_admin_month_switch_parsing():
     assert _MONTH_SWITCH.match("start chasing those receipts please") is None
 
 
+def test_ddl_splits_cleanly_for_postgres():
+    """Every statement the Postgres shim will execute must be real SQL — a
+    semicolon inside a DDL comment once split mid-comment and shipped garbage
+    to production (July 6). SQLite tests can't catch that; this does."""
+    from cfo_agent.engine import db
+    stmts = db.pg_statements(ledger.DDL.replace("{PK}", "BIGSERIAL PRIMARY KEY"))
+    assert stmts, "DDL produced no statements"
+    for s in stmts:
+        assert s.upper().startswith("CREATE "), f"garbage statement: {s[:60]!r}"
+
+
 def test_kv_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(kv, "RUNS_LOCAL", tmp_path)
     assert kv.get("close_month:august") is None

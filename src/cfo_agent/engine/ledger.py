@@ -80,8 +80,8 @@ CREATE TABLE IF NOT EXISTS merchant_rules (
   PRIMARY KEY (client, merchant_norm)
 );
 -- Append-only journal of HUMAN decisions (pal replies, dashboard edits,
--- approvals). Agent proposals are rebuildable and live on ledger_lines; human
--- decisions are durable and REPLAY on top after any close re-run
+-- approvals). Agent proposals are rebuildable and live on ledger_lines, while
+-- human decisions are durable and REPLAY on top after any close re-run
 -- (apply_decisions). Never updated, never deleted — it is also the audit trail.
 CREATE TABLE IF NOT EXISTS decisions (
   id               {PK},
