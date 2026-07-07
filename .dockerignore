@@ -1,0 +1,13 @@
+# Keep secrets, caches, and local state out of the image. clients/ and src/
+# must ship (config.py resolves /app/clients at runtime).
+.git
+.venv
+.env
+.pytest_cache
+__pycache__
+**/__pycache__
+runs/
+tests/
+*.sqlite3
+*.egg-info
+.DS_Store

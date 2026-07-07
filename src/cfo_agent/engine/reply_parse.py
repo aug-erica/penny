@@ -9,9 +9,23 @@ a garbled reply never mis-tags silently.
 from __future__ import annotations
 
 import json
+import re
 from typing import List, Optional
 
 from ..config import env
+
+# A pal asking to see/edit the full review workbook (Option A: reviewers and any
+# pal who wants line-by-line control use the workbook, the single source of truth).
+# Kept tight — a false negative just means they ask again; a false positive would
+# dump a link unprompted.
+_WORKBOOK_REQUEST = re.compile(
+    r"\b(workbook|spread ?sheet|excel|the (review )?sheet|line[- ]by[- ]line|"
+    r"full (list|ledger)|see (all|everything|the whole))\b", re.I)
+
+
+def wants_workbook(reply: str) -> bool:
+    """True when the reply asks for the review workbook / to edit line-by-line."""
+    return bool(_WORKBOOK_REQUEST.search(reply or ""))
 
 MODEL = "claude-haiku-4-5-20251001"
 
@@ -117,12 +131,19 @@ def interpret_recategorizations(client: str, reply: str, charges: list,
     for d in raw:
         i = d.get("i")
         cat = d.get("new_category")
-        if not isinstance(i, int) or not (0 <= i < len(charges)) or cat not in valid:
+        if not isinstance(i, int) or not (0 <= i < len(charges)) or not cat:
             continue
         if cat == charges[i].get("proposed_coa_line"):
             continue
-        out.append({"external_id": charges[i]["external_id"],
-                    "merchant": charges[i]["merchant_raw"],
-                    "old": charges[i].get("proposed_coa_line"),
-                    "new_category": cat, "why": d.get("why", "")})
+        item = {"external_id": charges[i]["external_id"],
+                "merchant": charges[i]["merchant_raw"],
+                "old": charges[i].get("proposed_coa_line"),
+                "new_category": cat, "why": d.get("why", ""),
+                "valid": cat in valid}
+        if not item["valid"]:
+            # Not an exact COA line — suggest the closest real ones for Penny to ask.
+            from rapidfuzz import process, fuzz
+            item["suggestions"] = [m for m, _s, _ in
+                                   process.extract(cat, coa_lines, scorer=fuzz.WRatio, limit=3)]
+        out.append(item)
     return out

@@ -15,6 +15,8 @@ import re
 import shutil
 from pathlib import Path
 
+from . import gdrive
+
 
 def receipts_dir(cfg, month: str) -> Path:
     d = cfg.data_root / "receipts" / month
@@ -26,11 +28,17 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:40]
 
 
-def store_file(cfg, month: str, pal: str, line: dict, src_path: Path) -> Path:
-    """Copy a receipt file into the repository; return its stored path."""
+def store_file(cfg, month: str, pal: str, line: dict, src_path: Path):
+    """Put a receipt file into the repository; return where it landed.
+
+    Cloud (service account configured): upload to the Brain Drive, return the
+    Drive link. Local: copy into the synced folder, return the Path. Either way
+    the return value is what gets stored as the ledger's receipt_link."""
     ext = Path(src_path).suffix or ".pdf"
     name = (f"{_slug(pal)}__{_slug(line['merchant_raw'])}__"
             f"{line['amount_cents']/100:.2f}__{line['txn_date']}{ext}")
+    if gdrive.configured():
+        return gdrive.upload(src_path, name, month)
     dest = receipts_dir(cfg, month) / name
     # Never overwrite an existing receipt (e.g. multiple unmatched files).
     if dest.exists():

@@ -1,10 +1,10 @@
-"""The review surface: one xlsx workbook per close, written locally then moved
-into the Drive runs folder atomically (Drive sync dislikes in-place writes).
+"""A point-in-time xlsx snapshot of a close, written to the Drive runs folder.
 
-The 'Proposed COA' column is an editable dropdown (the full chart of accounts):
-the reviewer corrects any wrong line in place. On re-import (`cfo close
-ingest-review`) each change becomes both the approved category and a rule for
-next month. A hidden ID column carries external_id so edits map back exactly.
+NOTE: since the Railway migration this is a read-only EXPORT for records — the
+live, editable review surface is the Penny dashboard (edits there write straight
+to Postgres). The old edit-the-dropdown-and-re-import loop is retired. The COA
+column still renders as a dropdown, but changes in the file are not read back;
+make corrections in the dashboard.
 """
 from __future__ import annotations
 
@@ -51,9 +51,9 @@ def write_review_workbook(lines: list, gaps: dict, summary: dict, dest: Path,
     ws.append(["Expense Close — agent draft (nothing posts without approval)"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([])
-    ws.append(["How to review: fix any wrong category in the 'Proposed COA' "
-               "dropdown on the Ledger tab, then save. We re-import your edits — "
-               "each fix is booked and becomes a rule for next month."])
+    ws.append(["Read-only snapshot for records. To make corrections, use the live "
+               "Penny dashboard (penny-dashboard-production.up.railway.app) — edits "
+               "there save to the ledger instantly and teach next month's proposals."])
     ws.append([])
     for k, v in summary.items():
         ws.append([k, v])

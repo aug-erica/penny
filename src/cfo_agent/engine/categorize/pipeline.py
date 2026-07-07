@@ -11,6 +11,7 @@ from __future__ import annotations
 from .. import ledger
 from . import history as history_mod
 from . import rules as rules_mod
+from ...models import Proposal
 
 
 def categorize_month(conn, cfg, close_month: str, use_llm: bool = True) -> dict:
@@ -20,11 +21,19 @@ def categorize_month(conn, cfg, close_month: str, use_llm: bool = True) -> dict:
     lines = [l for l in ledger.lines_for_month(conn, cfg.client, close_month)
              if l["status"] == "draft" and l["amount_cents"] > 0
              and (l["source"] == "card_feed" or l.get("reimbursable"))]
+    # The flywheel: reviewer corrections from prior months (durable in Postgres)
+    # auto-propose this month, ahead of the curated seed rules.
+    learned = ledger.learned_rules(conn, cfg.client)
     stats = {"rule": 0, "history": 0, "llm": 0, "needs_reviewer": 0,
              "disagrees_with_expensify": 0}
     leftovers = []
     for line in lines:
-        prop = rules_mod.propose(cfg.rules, line)
+        coa = learned.get(line["merchant_norm"])
+        if coa:
+            prop = Proposal(coa_line=coa, proposed_by="rule", confidence="high",
+                            rationale=f"learned from a reviewer correction -> {coa}")
+        else:
+            prop = rules_mod.propose(cfg.rules, line)
         if prop is None:
             prop = history_mod.propose(conn, cfg.client, line)
         if prop is None:

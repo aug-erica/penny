@@ -14,6 +14,11 @@ bot:
   handle: "@Penny"
   digest_channel: "CR29V8J06"      # #finance — daily digest, first week of month only
   digest_days: 7                    # post the digest only for days 1–7 of the month
+  # Review workbook = the single source of truth. When a pal asks to see/edit the
+  # full list, Penny replies with this Drive link (per close month). Reviewers
+  # (Purvi) edit the Proposed COA dropdown here and we re-import.
+  review_workbook_url:
+    "2026-06": "https://drive.google.com/file/d/1L_6SZ8DZdqaU-vP-ekVGO_1W7GnQ2yjI/view"
   # Admins who can file/act on behalf of another pal (by naming them in the DM).
   admins: ["U094H9WBE", "U09MANP29UP"]   # Erica, Purvi
   # Slack user id -> cardholder, so the listener maps a DM sender to their charges.

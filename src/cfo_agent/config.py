@@ -8,7 +8,12 @@ from pathlib import Path
 
 import yaml
 
-CLIENTS_DIR = Path(__file__).resolve().parents[2] / "clients"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+CLIENTS_DIR = _REPO_ROOT / "clients"
+# Canonical local DB/cache dir. Defined once here so every entry point (CLI,
+# listener, catch-up) shares ONE ledger — never derive it from __file__ depth in
+# individual modules (that split the listener onto its own DB once already).
+RUNS_LOCAL = _REPO_ROOT / "runs"
 
 
 @dataclass

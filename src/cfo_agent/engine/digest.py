@@ -3,10 +3,32 @@ week of the month. Summarizes where each pal stands: responded or not, and what
 they still owe (a project call, a receipt, or a reviewer decision)."""
 from __future__ import annotations
 
-from .dm_assemble import BILLABLE_CANDIDATE, _receipt_needed
+from datetime import datetime, timezone
+
+from .dm_assemble import BILLABLE_CANDIDATE
+from .receipts import receipt_needed
 from . import ledger
 
 _HAVE_RECEIPT = ("stored", "referenced", "received")
+
+
+def post_if_due(conn, cfg, month: str, penny) -> str:
+    """Post the daily digest to #finance if it's the first week and we haven't
+    already posted today. Idempotent — safe to call on a loop (the listener's
+    scheduler does). Returns a short status string."""
+    bot = cfg.raw.get("bot", {})
+    today = datetime.now(timezone.utc).date().isoformat()
+    if int(today[8:10]) > int(bot.get("digest_days", 7)):
+        return "past first week"
+    if ledger.digest_posted(conn, cfg.client, month, today):
+        return "already posted today"
+    channel = bot.get("digest_channel")
+    if not channel:
+        return "no digest channel configured"
+    text = build_digest(conn, cfg, month, day=int(today[8:10]))
+    penny._post("chat.postMessage", channel=channel, text=text)
+    ledger.mark_digest_posted(conn, cfg.client, month, today)
+    return "posted"
 
 
 def _pal_status(charges: list) -> dict:
@@ -15,7 +37,7 @@ def _pal_status(charges: list) -> dict:
     # already declared not-billable by the pal.
     untagged = [c for c in charges if c.get("proposed_coa_line") in BILLABLE_CANDIDATE
                 and not c.get("project") and c.get("billable") != 0]
-    needed = _receipt_needed(charges)
+    needed = receipt_needed(charges)
     missing_receipts = [c for c in needed if c.get("receipt_status") not in _HAVE_RECEIPT]
     needs_reviewer = [c for c in charges if not c.get("proposed_coa_line")]
     # "Responded" = signals ONLY a human reply produces: a recategorization, a

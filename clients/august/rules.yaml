@@ -80,5 +80,97 @@ merchant_rules:
   kind: exact
   coa_line: Sales, Speaking & Conferences
   source: reviewer-correction
+- match: UNITED
+  kind: exact
+  coa_line: General Travel
+  source: reviewer-correction
+- match: JACKBOX GAMES
+  kind: exact
+  coa_line: Team Culture:Employee Gifts & Benefits
+  source: reviewer-correction
+- match: ALMOND &AMP; OAK
+  kind: exact
+  coa_line: Team Culture:Employee Gifts & Benefits
+  source: reviewer-correction
+- match: PAGE TWO STRATEGIES INC
+  kind: exact
+  coa_line: Book Development and Publishing
+  source: reviewer-correction
+- match: AMZ*K6DBIAVJC IAD NONSTOP
+  kind: exact
+  coa_line: Groceries & Meals
+  source: reviewer-correction
+- match: IN *OVERALLS INC.
+  kind: exact
+  coa_line: Web Services & Subscriptions
+  source: reviewer-correction
+- match: LGA SPIRIT BELL
+  kind: exact
+  coa_line: Groceries & Meals
+  source: reviewer-correction
+- match: ALOFT BROOKLYN
+  kind: exact
+  coa_line: General Travel
+  source: reviewer-correction
+- match: NAYVAX VENDING
+  kind: exact
+  coa_line: Book Development and Publishing
+  source: reviewer-correction
+- match: FAIRFIELD INN SFO AP
+  kind: exact
+  coa_line: Billable Expense
+  source: reviewer-correction
+- match: ALAMO RENT-A-CAR
+  kind: exact
+  coa_line: Billable Expense
+  source: reviewer-correction
+- match: EXPEDIA
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: UA INFLT
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: RESIDENCE INN NEW YORK
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: JETBLUE
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: ALOFT FINANCIAL DISTRI
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: RESIDENCE INN NEW YORK
+  kind: exact
+  coa_line: Billable Expense
+  source: reviewer-correction
+- match: JETBLUE
+  kind: exact
+  coa_line: Other Miscellaneous Expense
+  source: reviewer-correction
+- match: ALOFT FINANCIAL DISTRI
+  kind: exact
+  coa_line: Other Miscellaneous Expense
+  source: reviewer-correction
+- match: SHAWARMA GUYS - SOUT
+  kind: exact
+  coa_line: Team Culture:Friday Lunch
+  source: reviewer-correction
+- match: DOORDASH ALDI
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
+- match: IVY STREET LLC
+  kind: exact
+  coa_line: Rent & Lease
+  source: reviewer-correction
+- match: DOORDASH JOLLIBEE
+  kind: exact
+  coa_line: Non-billable Expenses
+  source: reviewer-correction
 keyword_rules: []
 cardholder_defaults: {}

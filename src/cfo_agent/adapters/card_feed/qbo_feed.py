@@ -47,9 +47,22 @@ class QBOFeed:
         self._access_token = None
 
     # -- auth ----------------------------------------------------------------
+    @staticmethod
+    def _load_refresh_token() -> str:
+        """Latest rotated token from the KV store (survives Railway restarts);
+        the .env value is the seed / local fallback."""
+        try:
+            from ...engine import kv
+            tok = kv.get("qbo_refresh_token")
+            if tok:
+                return tok
+        except Exception:
+            pass
+        return env("QBO_REFRESH_TOKEN")
+
     def _refresh_access_token(self) -> str:
         cid, secret = env("QBO_CLIENT_ID"), env("QBO_CLIENT_SECRET")
-        refresh = env("QBO_REFRESH_TOKEN")
+        refresh = self._load_refresh_token()
         if not (cid and secret and refresh):
             raise QBOError("Missing QBO_CLIENT_ID / QBO_CLIENT_SECRET / QBO_REFRESH_TOKEN "
                            "in .env — run the OAuth Playground to get the refresh token.")
@@ -71,6 +84,16 @@ class QBOFeed:
 
     @staticmethod
     def _persist_refresh_token(new_refresh: str):
+        # Primary store is the DB (KV -> Postgres in the cloud): Railway's
+        # filesystem is ephemeral, so a rotated token written only to .env is
+        # lost on restart and auth dies. Never fail the run over persistence —
+        # but say so loudly, because a lost rotation is a slow-motion outage.
+        try:
+            from ...engine import kv
+            kv.set("qbo_refresh_token", new_refresh)
+        except Exception as exc:
+            print(f"⚠  could not persist rotated QBO refresh token to the DB: {exc}",
+                  flush=True)
         if not ENV_PATH.exists():
             return
         lines = ENV_PATH.read_text().splitlines()

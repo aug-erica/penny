@@ -14,6 +14,7 @@ import argparse
 import calendar
 import json
 import sys
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from .engine import validate as validate_mod
 from .engine.categorize import pipeline as cat_pipeline
 from .engine.normalize import card_txn_to_line, vault_expense_to_line
 
-RUNS_LOCAL = Path(__file__).resolve().parents[2] / "runs"
+from .config import RUNS_LOCAL
 
 
 def _month_bounds(month: str):
@@ -76,7 +77,15 @@ def _vault(cfg: ClientConfig):
 
 
 def _db(cfg: ClientConfig):
-    return ledger.open_db(RUNS_LOCAL / cfg.client / "ledger.sqlite3")
+    conn = ledger.open_db(RUNS_LOCAL / cfg.client / "ledger.sqlite3")
+    if not conn.is_pg:
+        # Guard against the split-brain trap: the live system of record is the
+        # cloud Postgres. A command run without DATABASE_URL silently hits a
+        # stale local file instead — warn loudly.
+        print("⚠  LEDGER = local SQLite, NOT the live cloud Postgres. "
+              "Set DATABASE_URL (Penny's DATABASE_PUBLIC_URL) to act on the real "
+              "ledger; otherwise you're editing a stale local copy.", file=sys.stderr)
+    return conn
 
 
 def cmd_verify_feed(args):
@@ -158,6 +167,14 @@ def cmd_close_run(args):
     if ev["overridden"]:
         print(f"event windows: {ev['overridden']} lines recoded to event categories")
 
+    # 3c. replay human decisions ON TOP of the fresh proposals — a re-run can
+    # never lose a pal's or reviewer's word (they're journaled, not just rows).
+    dec = ledger.apply_decisions(conn, cfg.client, month)
+    if dec["applied"] or dec["skipped"]:
+        print(f"decisions replayed: {dec['applied']} applied"
+              + (f", {dec['skipped']} skipped (line no longer present)"
+                 if dec["skipped"] else ""))
+
     # 4. artifacts
     lines = ledger.lines_for_month(conn, cfg.client, month)
     rec = _find_rec_report(cfg, m_end)
@@ -191,6 +208,30 @@ def cmd_close_run(args):
     return 0
 
 
+def cmd_close_approve(args):
+    """Reviewer sign-off over the month: mark every categorized line approved.
+    Approved lines are next month's top precedent source (the flywheel's real
+    fuel) and the population Phase 3 will post to QuickBooks. Refuses if any
+    line still has no category, unless --force."""
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    reviewer = cfg.section("reviewer").get("primary", "") or "cli"
+    res = ledger.approve_month(conn, cfg.client, args.month,
+                               decided_by=reviewer, force=args.force)
+    for l in res["blocked"]:
+        print(f"  [no category] {l['txn_date']} {l['merchant_raw'][:40]:40s} "
+              f"{l['amount_cents']/100:>9,.2f}  {l.get('cardholder') or ''}")
+    if res["refused"]:
+        print(f"REFUSED — {len(res['blocked'])} line(s) above have no category. "
+              "Categorize them (dashboard or Slack), or --force to approve the rest.")
+        return 1
+    print(f"approved {res['approved']} line(s) for {args.month}"
+          + (f" ({res['already']} already approved/posted)" if res["already"] else "")
+          + (f"; {len(res['blocked'])} left open (no category)" if res["blocked"] else ""))
+    print("These decisions are now the top precedent source for next month's close.")
+    return 0
+
+
 def cmd_close_validate(args):
     cfg = load_client(args.client)
     conn = _db(cfg)
@@ -204,76 +245,11 @@ def cmd_close_validate(args):
     return 0
 
 
-def cmd_close_ingest_review(args):
-    """Read Purvi's reviewed workbook back in: book every line as approved with
-    the reviewer's final category, and turn each correction into a merchant rule
-    for next month (the flywheel)."""
-    from .engine import review_ingest
-    from .engine.normalize import normalize_merchant
-
-    cfg = load_client(args.client)
-    conn = _db(cfg)
-    coa = set(cfg.coa_lines)
-    reviewed = review_ingest.read_reviewed(Path(args.file))
-
-    approved = corrections = skipped = 0
-    new_rules = {}   # merchant_norm -> coa_line
-    for r in reviewed:
-        line = ledger.line_by_external_id(conn, cfg.client, r["external_id"])
-        if not line:
-            skipped += 1
-            continue
-        final = r["final_coa"]
-        if not final or final not in coa:
-            skipped += 1
-            continue
-        changed = final != line.get("proposed_coa_line")
-        billable = 1 if r["billable"] else (0 if r["billable"] is not None else line.get("billable"))
-        ledger.set_proposal(conn, line["id"], final,
-                            "reviewer" if changed else (line.get("proposed_by") or "reviewer"),
-                            "high", ("reviewer-approved"
-                                     + (f" (was {line.get('proposed_coa_line')})" if changed else "")),
-                            billable=billable, status="approved")
-        approved += 1
-        if changed:
-            corrections += 1
-            new_rules[normalize_merchant(line["merchant_raw"])] = final
-
-    # 'reviewer' is a valid proposer for approved decisions.
-    written = _merge_rules(cfg, new_rules)
-    print(f"ingested {approved} approved lines ({corrections} corrections, "
-          f"{skipped} skipped/unmatched)")
-    if written:
-        print(f"wrote {written} new merchant rule(s) to clients/{cfg.client}/rules.yaml "
-              f"— they take effect next close")
-    print("approved decisions now feed merchant history as the top-authority source.")
-    return 0
-
-
-def _merge_rules(cfg, new_rules: dict) -> int:
-    """Append reviewer corrections as exact merchant rules; skip ones already
-    covered by an identical rule."""
-    import yaml
-    from .config import CLIENTS_DIR
-    if not new_rules:
-        return 0
-    path = CLIENTS_DIR / cfg.client / "rules.yaml"
-    data = yaml.safe_load(path.read_text()) or {}
-    rules = data.get("merchant_rules") or []
-    existing = {(r.get("match", "").upper(), r.get("coa_line")) for r in rules}
-    added = 0
-    for merch, coa in new_rules.items():
-        key = (merch.upper(), coa)
-        if key in existing or not merch:
-            continue
-        rules.append({"match": merch, "kind": "exact", "coa_line": coa,
-                      "source": "reviewer-correction"})
-        existing.add(key)
-        added += 1
-    if added:
-        data["merchant_rules"] = rules
-        path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
-    return added
+# Legacy workbook re-import (cmd_close_ingest_review) and the rules.yaml
+# file-writer (_merge_rules) were removed July 6, 2026. Reviewer corrections now
+# happen live — in the editable dashboard or via Slack — and persist to Postgres
+# (ledger.upsert_learned_rule), which the categorizer reads as the flywheel.
+# rules.yaml remains only for curated seed rules.
 
 
 def cmd_notify_build(args):
@@ -436,6 +412,9 @@ def cmd_notify_digest(args):
     from .adapters.slack_client import PennySlack, SlackError
     try:
         PennySlack()._post("chat.postMessage", channel=bot["digest_channel"], text=text)
+        from datetime import datetime, timezone
+        ledger.mark_digest_posted(conn, cfg.client, args.month,
+                                  datetime.now(timezone.utc).date().isoformat())
         print(f"\nposted to #finance ({bot['digest_channel']})")
     except SlackError as e:
         print(f"\npost failed: {e}"
@@ -465,6 +444,21 @@ def cmd_penny_listen(args):
     return 0
 
 
+def cmd_penny_catchup(args):
+    """Process any DMs Penny missed while offline (safe to re-run)."""
+    from .adapters.slack_client import PennySlack
+    from .engine import penny_catchup
+    cfg = load_client(args.client)
+    db_path = RUNS_LOCAL / cfg.client / "ledger.sqlite3"
+    done = penny_catchup.catch_up(cfg, args.month, PennySlack(), db_path,
+                                  post=args.post)
+    if not done:
+        print("no missed messages")
+    for pal, n in done:
+        print(f"  {pal}: {n} message(s) processed{'' if args.post else ' (dry-run, not sent)'}")
+    return 0
+
+
 def cmd_qbo_smoke(args):
     """Prove the QuickBooks connection: refresh the token and list credit-card
     accounts. Needs QBO_CLIENT_ID/SECRET/REFRESH_TOKEN/REALM_ID in .env."""
@@ -480,6 +474,101 @@ def cmd_qbo_smoke(args):
     except QBOError as e:
         print(f"QBO smoke failed: {e}")
         return 1
+    return 0
+
+
+def cmd_db_smoke(args):
+    """Prove the ledger backend: connect, ensure schema, round-trip a write.
+    On Railway (DATABASE_URL set) this confirms Postgres; locally, SQLite."""
+    from .engine import db
+    conn = ledger.open_db(RUNS_LOCAL / args.client / "ledger.sqlite3")
+    kind = "Postgres" if conn.is_pg else "SQLite"
+    ledger.mark_dm_processed(conn, "smoke-test-ts", "smoke")
+    n = len(ledger.processed_dm_ts(conn))
+    lines = len(ledger.lines_for_month(conn, args.client, args.month)) if args.month else 0
+    print(f"OK — ledger backend is {kind}. processed_dm rows: {n}"
+          + (f"; {lines} lines for {args.month}" if args.month else ""))
+    print(f"  DATABASE_URL {'set' if db.database_url() else 'not set (local SQLite)'}")
+    return 0
+
+
+def cmd_db_import(args):
+    """One-time cutover: load the local SQLite ledger INTO Postgres. Run with
+    DATABASE_URL pointing at the target Postgres. Safe to re-run (ON CONFLICT
+    DO NOTHING)."""
+    import sqlite3 as sq
+    from .engine import db
+    if not db.database_url():
+        print("Set DATABASE_URL to the target Postgres first (this loads INTO it).")
+        return 1
+    src = sq.connect(args.from_path)
+    src.row_factory = sq.Row
+    dst = ledger.open_db(RUNS_LOCAL / args.client / "ledger.sqlite3")  # -> Postgres
+    if not dst.is_pg:
+        print("DATABASE_URL did not resolve to Postgres — aborting.")
+        return 1
+    conflict = {"runs": "(run_id)", "merchant_history":
+                "(client, merchant_norm, coa_line, close_month)",
+                "processed_dm": "(ts)", "ledger_lines": "(id)"}
+    counts = {}
+    # ledger_lines last, and in two passes, to satisfy its self-FK matched_line_id.
+    for t in ["runs", "merchant_history", "processed_dm", "ledger_lines"]:
+        cols = [r[1] for r in src.execute(f"PRAGMA table_info({t})")]
+        rows = src.execute(f"SELECT * FROM {t}").fetchall()
+        if t == "ledger_lines":
+            ins = [c for c in cols if c != "matched_line_id"]
+            ph = ",".join(["?"] * len(ins))
+            dst.executemany(f"INSERT INTO ledger_lines ({','.join(ins)}) VALUES ({ph}) "
+                            "ON CONFLICT (id) DO NOTHING",
+                            [tuple(r[c] for c in ins) for r in rows])
+            upd = [(r["matched_line_id"], r["id"]) for r in rows
+                   if r["matched_line_id"] is not None]
+            dst.executemany("UPDATE ledger_lines SET matched_line_id=? WHERE id=?", upd)
+        else:
+            ph = ",".join(["?"] * len(cols))
+            dst.executemany(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) "
+                            f"ON CONFLICT {conflict[t]} DO NOTHING",
+                            [tuple(r[c] for c in cols) for r in rows])
+        dst.commit()
+        counts[t] = len(rows)
+    for t, idc in [("runs", "run_id"), ("ledger_lines", "id")]:
+        dst.execute(f"SELECT setval(pg_get_serial_sequence('{t}','{idc}'), "
+                    f"COALESCE((SELECT MAX({idc}) FROM {t}), 1))")
+    dst.commit()
+    print("imported into Postgres:", counts)
+    return 0
+
+
+def cmd_db_backfill(args):
+    """One-time: journal the current month's human edits as decision rows, so
+    edits made BEFORE the decisions journal existed survive future re-runs.
+    Run once per pre-journal month (refuses if rows already exist)."""
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    try:
+        made = ledger.backfill_decisions(conn, cfg.client, args.month)
+    except RuntimeError as exc:
+        print(f"refused: {exc}")
+        return 1
+    print(f"backfilled {made} decision row(s) for {args.month}")
+    return 0
+
+
+def cmd_drive_smoke(args):
+    """Prove Drive receipt storage: upload a tiny test file and print its link.
+    Needs GOOGLE_SERVICE_ACCOUNT_JSON + DRIVE_RECEIPTS_FOLDER_ID."""
+    from .engine import gdrive
+    if not gdrive.configured():
+        print("Drive not configured — set GOOGLE_SERVICE_ACCOUNT_JSON and "
+              "DRIVE_RECEIPTS_FOLDER_ID (falls back to local filesystem).")
+        return 1
+    tmp = Path(tempfile.mktemp(suffix=".txt"))
+    tmp.write_text("Penny Drive smoke test — safe to delete.")
+    try:
+        link = gdrive.upload(tmp, "penny-drive-smoke-test.txt", args.month or "smoke")
+        print(f"OK — uploaded to Drive: {link}")
+    finally:
+        tmp.unlink(missing_ok=True)
     return 0
 
 
@@ -543,10 +632,12 @@ def main(argv=None):
     val.add_argument("--client", required=True)
     val.add_argument("--month", required=True)
     val.set_defaults(fn=cmd_close_validate)
-    ing = csub.add_parser("ingest-review")
-    ing.add_argument("--client", required=True)
-    ing.add_argument("--file", required=True, help="the reviewed review_<month>.xlsx")
-    ing.set_defaults(fn=cmd_close_ingest_review)
+    ap = csub.add_parser("approve", help="reviewer sign-off: mark categorized lines approved")
+    ap.add_argument("--client", required=True)
+    ap.add_argument("--month", required=True)
+    ap.add_argument("--force", action="store_true",
+                    help="approve categorized lines even if some have no category yet")
+    ap.set_defaults(fn=cmd_close_approve)
 
     notify = sub.add_parser("notify")
     nsub = notify.add_subparsers(dest="subcmd", required=True)
@@ -605,6 +696,33 @@ def main(argv=None):
     pl.add_argument("--client", required=True)
     pl.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
     pl.set_defaults(fn=cmd_penny_listen)
+    pc = psub.add_parser("catchup")
+    pc.add_argument("--client", required=True)
+    pc.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
+    pc.add_argument("--post", action="store_true", help="send confirm-backs (else dry-run)")
+    pc.set_defaults(fn=cmd_penny_catchup)
+
+    db_p = sub.add_parser("db")
+    dbsub = db_p.add_subparsers(dest="subcmd", required=True)
+    dbs = dbsub.add_parser("smoke", help="prove the ledger backend (Postgres in cloud)")
+    dbs.add_argument("--client", default="august")
+    dbs.add_argument("--month", default=None)
+    dbs.set_defaults(fn=cmd_db_smoke)
+    dbi = dbsub.add_parser("import-sqlite", help="one-time cutover load: SQLite -> Postgres")
+    dbi.add_argument("--client", default="august")
+    dbi.add_argument("--from", dest="from_path", required=True, help="path to local ledger.sqlite3")
+    dbi.set_defaults(fn=cmd_db_import)
+    dbb = dbsub.add_parser("backfill-decisions",
+                           help="one-time: journal pre-existing human edits as decisions")
+    dbb.add_argument("--client", default="august")
+    dbb.add_argument("--month", required=True, help="YYYY-MM")
+    dbb.set_defaults(fn=cmd_db_backfill)
+
+    drive_p = sub.add_parser("drive")
+    drsub = drive_p.add_subparsers(dest="subcmd", required=True)
+    drs = drsub.add_parser("smoke", help="prove Drive receipt storage (upload a test file)")
+    drs.add_argument("--month", default=None)
+    drs.set_defaults(fn=cmd_drive_smoke)
 
     args = p.parse_args(argv)
     sys.exit(args.fn(args))

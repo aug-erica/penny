@@ -9,16 +9,11 @@ from __future__ import annotations
 import html
 from datetime import date
 
+from .receipts import RECEIPT_THRESHOLD_CENTS, receipt_needed
+
 # Categories that might be re-billed to a project — the only ones we ask about.
 BILLABLE_CANDIDATE = {"Billable Expense", "General Travel"}
 TRIP_GAP_DAYS = 4          # a >4-day gap starts a new "trip"
-RECEIPT_THRESHOLD_CENTS = 10000   # receipts required over $100 (policy, Purvi July 2)
-
-
-def _receipt_needed(charges: list) -> list:
-    # Over threshold OR confirmed-billable-to-a-project — not the LLM's guess.
-    return [c for c in charges if c.get("billable") and c.get("project")
-            or c["amount_cents"] >= RECEIPT_THRESHOLD_CENTS]
 
 
 def _money(cents: int) -> str:
@@ -52,10 +47,12 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     total = sum(l["amount_cents"] for l in charges)
     billable_candidates = [l for l in charges
                            if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
-    receipts_needed = _receipt_needed(charges)
+    receipts_needed = receipt_needed(charges)
+    month_name = (date.fromisoformat(charges[0]["close_month"] + "-01").strftime("%B")
+                  if charges else "this month")
 
     out = [f"👋 Hey {pal_first} — it's {bot_name}, August's expense bot. I've pulled and "
-           f"categorized your {len(charges)} August-card charges for June ({_money(total)}). "
+           f"categorized your {len(charges)} August-card charges for {month_name} ({_money(total)}). "
            f"Here's what I've got, grouped by category so it's easy to skim — then a "
            f"couple quick things below."]
 
@@ -96,7 +93,8 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
         out.append(f"\n*{next(step)} Receipts, please* (reply here with a photo or PDF — I'll file them):")
         for l in receipts_needed:
             out.append(f"   • {_merchant(l['merchant_raw'])} — {_money(l['amount_cents'])} ({l['txn_date']})")
-        out.append("   _(Billable items need a receipt, plus anything over $75.)_")
+        out.append(f"   _(Billable items need a receipt, plus anything over "
+                   f"${RECEIPT_THRESHOLD_CENTS // 100}.)_")
 
     if not billable_candidates and not receipts_needed:
         out.append("\nNothing else needed from you this month — all set. 🎉")
@@ -118,7 +116,7 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
     not_billable = [l for l in candidates if l.get("billable") == 0]
     untagged = [l for l in candidates
                 if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
-    needed = _receipt_needed(charges)
+    needed = receipt_needed(charges)
     # A pal who replied with a file counts as "in hand" (stored OR referenced),
     # even if we haven't retained the file to a vault yet — don't nag them.
     have = ("stored", "referenced", "received")
