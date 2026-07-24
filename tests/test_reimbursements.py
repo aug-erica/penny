@@ -277,6 +277,27 @@ def test_billpayment_body_creditcard():
     assert b["TotalAmt"] == 50.0
 
 
+def test_book_month_groups_by_employee(tmp_path):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    _needs_info_row(conn, ext="reimb-K1", employee="Keara Mascareñas",
+                    amount_cents=5000, proposed_coa_line="Telephone & Internet",
+                    status="approved")
+    _needs_info_row(conn, ext="reimb-K2", employee="Keara Mascareñas",
+                    amount_cents=4200, proposed_coa_line="Groceries & Meals",
+                    status="approved")
+    _needs_info_row(conn, ext="reimb-E1", employee="Erica Seldin",
+                    amount_cents=12000, proposed_coa_line="Sales, Speaking & Conferences",
+                    status="approved")
+    res = reimburse_flow.book_month(conn, cfg, "2026-07", post=False)   # dry-run, no QBO
+    assert res["txn_date"] == "2026-07-31"                             # month-end
+    plan = {b["employee"]: b for b in res["bills"]}
+    assert plan["Keara Mascareñas"]["n_lines"] == 2                    # grouped into one Bill
+    assert plan["Keara Mascareñas"]["total_cents"] == 9200
+    assert plan["Erica Seldin"]["n_lines"] == 1
+    assert "bill_id" not in plan["Keara Mascareñas"]                   # dry-run posts nothing
+
+
 def test_bill_reimbursement_flags_missing_category(tmp_path):
     # No category -> flagged before any QBO call (safe, offline).
     conn = ledger.open_db(tmp_path / "l.sqlite3")

@@ -646,6 +646,28 @@ def cmd_reimburse_post_bill(args):
     return 0
 
 
+def cmd_reimburse_book_month(args):
+    """Create (or preview) one grouped QBO Bill per employee for the month — a
+    multi-line Bill dated month-end. Dry-run unless --post."""
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    res = reimburse_flow.book_month(conn, cfg, args.month, post=args.post,
+                                    bill_date=args.date)
+    print(f"Grouped Bills for {res['month']} (dated {res['txn_date']}):")
+    for b in res["bills"]:
+        tag = f"  [QBO Bill {b['bill_id']}]" if b.get("bill_id") else ""
+        print(f"  {b['employee']}: {b['n_lines']} line(s), "
+              f"${b['total_cents']/100:.2f} -> vendor {b.get('vendor_name')}{tag}")
+        for p in b.get("problems", []):
+            print(f"     ⚠ {p}")
+    if not res["bills"]:
+        print("  (nothing eligible to bill)")
+    if not args.post:
+        print("\n(dry-run — add --post to create the Bills in QBO)")
+    return 0
+
+
 def cmd_reimburse_pay_bill(args):
     """Create (or preview) the Bill Payment that marks a reimbursement's Bill paid,
     crediting the 1345 reimbursement clearing account. Dry-run unless --post."""
@@ -951,7 +973,13 @@ def main(argv=None):
     rmp.add_argument("--id", type=int, default=None, help="one reimbursement (else all exported)")
     rmp.add_argument("--post", action="store_true", help="actually mark paid (else dry-run)")
     rmp.set_defaults(fn=cmd_reimburse_mark_paid)
-    rpb = rsub.add_parser("post-bill", help="create/preview the QBO Bill for a reimbursement")
+    rbm = rsub.add_parser("book-month", help="create one grouped QBO Bill per employee for the month")
+    rbm.add_argument("--client", required=True)
+    rbm.add_argument("--month", required=True)
+    rbm.add_argument("--date", default=None, help="Bill date (default: last day of the month)")
+    rbm.add_argument("--post", action="store_true", help="create the Bills in QBO (else dry-run)")
+    rbm.set_defaults(fn=cmd_reimburse_book_month)
+    rpb = rsub.add_parser("post-bill", help="[legacy/single] create/preview a QBO Bill for one reimbursement")
     rpb.add_argument("--client", required=True)
     rpb.add_argument("--id", type=int, required=True)
     rpb.add_argument("--post", action="store_true", help="create the Bill in QBO (else dry-run)")

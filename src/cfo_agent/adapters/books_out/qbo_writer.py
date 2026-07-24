@@ -286,6 +286,43 @@ def create_bill(q, vendor_id, gl_id, amount_cents, txn_date, memo=None,
     return resp.json().get("Bill", resp.json())
 
 
+def bill_body_lines(vendor_id, lines, txn_date, memo=None, ap_account_id=None) -> dict:
+    """A multi-line Bill body. `lines` = [{gl_id, amount_cents, description}] — one
+    expense line per reimbursement, each on its own category GL. Used to group an
+    employee's month of reimbursements into a single Bill."""
+    body_lines = []
+    for l in lines:
+        bl = {"DetailType": "AccountBasedExpenseLineDetail",
+              "Amount": round(l["amount_cents"] / 100.0, 2),
+              "AccountBasedExpenseLineDetail": {"AccountRef": {"value": str(l["gl_id"])}}}
+        desc = (l.get("description") or "").strip()
+        if desc:
+            bl["Description"] = desc[:1000]
+        body_lines.append(bl)
+    body = {"VendorRef": {"value": str(vendor_id)}, "TxnDate": txn_date, "Line": body_lines}
+    if memo:
+        body["PrivateNote"] = memo
+    if ap_account_id:
+        body["APAccountRef"] = {"value": str(ap_account_id)}
+    return body
+
+
+def create_bill_lines(q, vendor_id, lines, txn_date, memo=None, ap_account_id=None) -> dict:
+    """Create a multi-line Bill (grouped reimbursements). Returns the Bill object."""
+    body = bill_body_lines(vendor_id, lines, txn_date, memo, ap_account_id)
+    if not q._access_token:
+        q._refresh_access_token()
+    url = f"{q.base}/v3/company/{q.realm_id}/bill?minorversion={MINOR_VERSION}"
+    resp = httpx.post(url, headers={"Authorization": f"Bearer {q._access_token}",
+                                    "Accept": "application/json",
+                                    "Content-Type": "application/json"},
+                      json=body, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"QBO create Bill failed: HTTP {resp.status_code} "
+                           f"{resp.text[:400]}")
+    return resp.json().get("Bill", resp.json())
+
+
 def billpayment_body(bill_id, vendor_id, amount_cents, txn_date,
                      credit_account_id, ap_account_id=None) -> dict:
     """A BillPayment that pays `bill_id` with the offset going to
