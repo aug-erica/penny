@@ -26,7 +26,11 @@ coa_lines:
   - "Team Culture:Friday Lunch"
   - "Team Culture:Summit & In Person Weeks"
   - "Telephone & Internet"
+  - "Uber Accrued Expenses"
   - "Web Services & Subscriptions"
+# NB: "Uber Accrued Expenses" is an accrual-clearing account (Other Current
+# Liability, GL 2251), not an expense line — UBER *BUSINESS charges clear the
+# accrual rather than hitting General Travel (per Natalie/Skyfin, July 2026).
 gl_codes:
   "Billable Expense": "5040"
   "Book Development and Publishing": "8520"
@@ -51,4 +55,5 @@ gl_codes:
   "Team Culture:Friday Lunch": "7550"
   "Team Culture:Summit & In Person Weeks": "7510"
   "Telephone & Internet": "6670"
+  "Uber Accrued Expenses": "2251"
   "Web Services & Subscriptions": "8536"

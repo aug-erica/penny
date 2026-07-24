@@ -106,34 +106,43 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     return "\n".join(out)
 
 
-def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
+def confirm_back(pal_first: str, charges: list, bot_name: str, touched=None) -> str:
     """After interpreting a reply, echo exactly what was recorded so the pal can
-    catch a miss (the conservative interpreter under-tags rather than guess)."""
+    catch a miss (the conservative interpreter under-tags rather than guess).
+    `touched` (external_ids changed by this reply) scopes the "recorded" echoes so
+    we don't re-list earlier decisions when charges span months; the "still need"
+    prompts stay full-state."""
     charges = [l for l in charges if l["status"] != "excluded" and l["amount_cents"] > 0]
+    _this = lambda l: touched is None or l["external_id"] in touched
     candidates = [l for l in charges if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
     # Any charge tagged billable+project counts (a pal can bill a non-travel item).
     billable = [l for l in charges if l.get("billable") and l.get("project")]
-    not_billable = [l for l in candidates if l.get("billable") == 0]
+    not_billable = [l for l in candidates if l.get("billable") == 0 and _this(l)]
     untagged = [l for l in candidates
                 if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
     needed = receipt_needed(charges)
     # A pal who replied with a file counts as "in hand" (stored OR referenced),
     # even if we haven't retained the file to a vault yet — don't nag them.
     have = ("stored", "referenced", "received")
-    filed = [l for l in needed if l.get("receipt_status") == "stored"]
+    filed = [l for l in needed if l.get("receipt_status") == "stored" and _this(l)]
     missing_receipts = [l for l in needed if l.get("receipt_status") not in have]
 
-    recategorized = [l for l in charges if l.get("proposed_by") == "reviewer"]
+    # "Recorded" echoes are scoped to this reply's changes; "still need" is full state.
+    recategorized = [l for l in charges if l.get("proposed_by") == "reviewer" and _this(l)]
+    # Billable expenses need a one-line invoice description for Natalie (what
+    # Expensify captured). Ask for any that don't have one yet.
+    need_note = [l for l in billable if not l.get("billable_note")]
 
     out = [f"Thanks {pal_first}! Here's what I recorded — reply if any of it's off:"]
     if recategorized:
         out.append("\n✏️ *Recategorized:*")
         for l in recategorized:
             out.append(f"   • {_merchant(l['merchant_raw'])} → {l['proposed_coa_line']}")
-    if billable:
+    if [l for l in billable if _this(l)]:
         out.append("\n✅ *Billable:*")
-        for l in billable:
-            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} → {l['project']}")
+        for l in [l for l in billable if _this(l)]:
+            note = f" — _{l['billable_note']}_" if l.get("billable_note") else ""
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} → {l['project']}{note}")
     if not_billable:
         out.append(f"\n🚫 *Not billable:* {len(not_billable)} charge(s) — got it.")
     if untagged:
@@ -150,6 +159,11 @@ def confirm_back(pal_first: str, charges: list, bot_name: str) -> str:
             out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])}")
     elif needed and not filed:
         out.append("\n📎 Receipts: all in — thank you!")
-    if not untagged and not missing_receipts:
+    if need_note:
+        out.append("\n📝 *One line for the invoice, please* — since these are billable, "
+                   "what was each one for? (Natalie puts this on the client invoice.)")
+        for l in need_note:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['project']})")
+    if not untagged and not missing_receipts and not need_note:
         out.append("\nYou're all set. 🎉 Nothing else needed.")
     return "\n".join(out)

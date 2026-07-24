@@ -52,12 +52,16 @@ def catch_up(cfg, month: str, penny, db_path, post: bool = True, log=print) -> l
             continue   # preview only — no ledger writes, no receipt downloads
         res, last_ts = None, None
         for m in pending:
+            if not ledger.claim_dm(conn, m.get("ts"), cardholder):
+                continue   # claimed by the live listener in the meantime
             fids = [f["id"] for f in m.get("files", []) if f.get("id")]
-            res = reply_flow.process_pal_reply(
-                conn, cfg, cardholder, m.get("text", "") or "", month,
-                slack=penny, file_ids=fids)
-            last_ts = m.get("ts")
-            ledger.mark_dm_processed(conn, m.get("ts"), cardholder)
+            try:
+                res = reply_flow.process_pal_reply(
+                    conn, cfg, cardholder, m.get("text", "") or "", month,
+                    slack=penny, file_ids=fids)
+                last_ts = m.get("ts")
+            except Exception:
+                ledger.unclaim_dm(conn, m.get("ts"))
         # One confirm-back per pal, threaded under their most recent message
         # (the confirm-back is recomputed from full ledger state each call).
         if res and last_ts:

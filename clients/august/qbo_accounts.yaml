@@ -1,0 +1,91 @@
+expense_accounts:
+  Billable Expense:
+    qbo_id: '219'
+    qbo_name: Billable Expense
+    gl_num: '5040'
+  Book Development and Publishing:
+    qbo_id: '1150040006'
+    qbo_name: Book Development and Publishing
+    gl_num: '8520'
+  Book Printing COGS:
+    qbo_id: '1150040009'
+    qbo_name: Book Printing COGS
+    gl_num: '5053'
+  Donations:
+    qbo_id: '148'
+    qbo_name: Donations
+    gl_num: '6420'
+  General Travel:
+    qbo_id: '155'
+    qbo_name: General Travel
+    gl_num: '8535'
+  Groceries & Meals:
+    qbo_id: '150'
+    qbo_name: Groceries & Meals
+    gl_num: '8532'
+  Moving & Relocation:
+    qbo_id: '132'
+    qbo_name: Moving & Relocation
+    gl_num: '6310'
+  Non-billable Expenses:
+    qbo_id: '115'
+    qbo_name: Non-billable Expenses
+    gl_num: '5060'
+  Office Supplies (NY & Home):
+    qbo_id: '151'
+    qbo_name: Office Supplies
+    gl_num: '8533'
+  Other Miscellaneous Expense:
+    qbo_id: '193'
+    qbo_name: Other Miscellaneous Expense
+    gl_num: '7050'
+  Professional Development:
+    qbo_id: '182'
+    qbo_name: Professional Development
+    gl_num: '7000'
+  R&D AI Everyday (Internal Tools & Training):
+    qbo_id: '1150040008'
+    qbo_name: R&D AI Everyday (Internal Tools & Training)
+    gl_num: '8563'
+  Rent & Lease:
+    qbo_id: '173'
+    qbo_name: Rent & Lease
+    gl_num: '6500'
+  Sales - Client Engagement & Lead Development:
+    qbo_id: '142'
+    qbo_name: Client Engagement & Lead Development
+    gl_num: '8513'
+  Sales System Improvements and Coaching (GBAS):
+    qbo_id: '317'
+    qbo_name: Sales System Improvements and Coaching (GBAS)
+    gl_num: '8511'
+  Sales, Speaking & Conferences:
+    qbo_id: '367'
+    qbo_name: Conferences
+    gl_num: '8561'
+  Team Culture:Employee Gifts & Benefits:
+    qbo_id: '185'
+    qbo_name: Employee Gifts & Benefits
+    gl_num: '7520'
+  Team Culture:Friday Lunch:
+    qbo_id: '334'
+    qbo_name: Friday Lunch
+    gl_num: '7550'
+  Team Culture:Summit & In Person Weeks:
+    qbo_id: '184'
+    qbo_name: Summit & In Person Weeks
+    gl_num: '7510'
+  Telephone & Internet:
+    qbo_id: '175'
+    qbo_name: Telephone & Internet
+    gl_num: '6670'
+  # Accrual-clearing target (Other Current Liability, not an expense) — UBER
+  # *BUSINESS charges book here to clear the accrual, per Natalie/Skyfin.
+  Uber Accrued Expenses:
+    qbo_id: '1150040007'
+    qbo_name: 'Accrued Expense:Uber Accrued Expenses'
+    gl_num: '2251'
+  Web Services & Subscriptions:
+    qbo_id: '168'
+    qbo_name: Web Services & Subscriptions
+    gl_num: '8536'

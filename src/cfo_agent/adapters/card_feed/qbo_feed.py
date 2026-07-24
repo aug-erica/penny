@@ -61,17 +61,46 @@ class QBOFeed:
         return env("QBO_REFRESH_TOKEN")
 
     def _refresh_access_token(self) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        from ...engine import kv
+        # Reuse a shared, unexpired ACCESS token (valid ~1h) from the KV store
+        # instead of calling the refresh endpoint every time. Each refresh ROTATES
+        # the refresh token, and doing that per-call caused invalid_grant races
+        # between the poller, reply handler, and local scripts. Now we rotate at
+        # most ~hourly, when the cached access token is actually expired.
+        cached, exp = kv.get("qbo_access_token"), kv.get("qbo_access_expiry")
+        if cached and exp:
+            try:
+                if datetime.fromisoformat(exp) > datetime.now(timezone.utc) + timedelta(minutes=2):
+                    self._access_token = cached
+                    return cached
+            except ValueError:
+                pass
         cid, secret = env("QBO_CLIENT_ID"), env("QBO_CLIENT_SECRET")
         refresh = self._load_refresh_token()
+        seed = env("QBO_REFRESH_TOKEN")           # the .env / env-var seed token
         if not (cid and secret and refresh):
             raise QBOError("Missing QBO_CLIENT_ID / QBO_CLIENT_SECRET / QBO_REFRESH_TOKEN "
                            "in .env — run the OAuth Playground to get the refresh token.")
         basic = base64.b64encode(f"{cid}:{secret}".encode()).decode()
-        resp = httpx.post(TOKEN_URL, headers={
-            "Authorization": f"Basic {basic}",
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }, data={"grant_type": "refresh_token", "refresh_token": refresh}, timeout=60)
+
+        def _hit(rt: str) -> httpx.Response:
+            return httpx.post(TOKEN_URL, headers={
+                "Authorization": f"Basic {basic}",
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }, data={"grant_type": "refresh_token", "refresh_token": rt}, timeout=60)
+
+        resp = _hit(refresh)
+        # SELF-HEAL: if the stored (rotated) token is dead — e.g. killed by a
+        # concurrency race — fall back to the env-var seed. Recovery is then just
+        # "set a fresh QBO_REFRESH_TOKEN on the service"; no manual DB surgery.
+        if (resp.status_code != 200 and "invalid_grant" in resp.text
+                and seed and seed != refresh):
+            print("⚠  stored QBO refresh token rejected — retrying with env-var seed",
+                  flush=True)
+            resp = _hit(seed)
         if resp.status_code != 200:
             raise QBOError(f"Token refresh failed: HTTP {resp.status_code} {resp.text[:300]}")
         tok = resp.json()
@@ -80,6 +109,12 @@ class QBOFeed:
         if new_refresh and new_refresh != refresh:
             self._persist_refresh_token(new_refresh)
         self._access_token = tok["access_token"]
+        try:                                   # cache the access token for reuse
+            kv.set("qbo_access_token", self._access_token)
+            kv.set("qbo_access_expiry", (datetime.now(timezone.utc)
+                    + timedelta(seconds=int(tok.get("expires_in", 3600)) - 120)).isoformat())
+        except Exception:
+            pass
         return self._access_token
 
     @staticmethod

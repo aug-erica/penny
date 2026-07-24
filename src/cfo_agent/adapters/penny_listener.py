@@ -21,8 +21,9 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 
 from ..config import RUNS_LOCAL, env, load_client
+from ..engine import continuous_close as cc_mod
 from ..engine import digest as digest_mod
-from ..engine import kv, ledger, penny_catchup, reply_flow
+from ..engine import kv, ledger, penny_catchup, reimburse_flow, reply_flow
 from .slack_client import PennySlack
 
 # Daily digest posts around this hour UTC (~9am ET). The scheduler checks a few
@@ -72,18 +73,46 @@ def run(client_name: str, month: str):
     me = penny.auth_test()["user_id"]
 
     def active_month():
-        """Resolve the working close month PER EVENT (not once at startup):
-        the DB value (set by an admin DM) wins; --month is the fallback."""
-        return kv.active_month(cfg.client, month)
+        """Resolve the working month PER EVENT (not once at startup): an admin's
+        explicit choice (DB) wins; otherwise the CURRENT calendar month — because
+        charges post and replies come in for the month happening now (the
+        continuous close), not a static CLOSE_MONTH env that goes stale."""
+        import datetime as _dt
+        return kv.active_month(cfg.client, _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m"))
+
+    def _refers_to(cardholder: str, tl: str) -> bool:
+        """Does this message clearly refer to `cardholder` as a person? Requires a
+        STRONG signal — full name, or an explicit 'for X' / \"X's\" / '@X' / leading
+        'X:' cue — so ordinary words that happen to match a surname don't count
+        (e.g. 'Black' in 'Black Bull' must NOT resolve to Alexis Black)."""
+        parts = [p for p in re.split(r"[^a-z]+", cardholder.lower()) if len(p) > 1]
+        if not parts:
+            return False
+        first, last = parts[0], parts[-1]
+
+        def w(s):   # whole-word present
+            return re.search(r"\b" + re.escape(s) + r"\b", tl) is not None
+
+        if len(parts) >= 2 and w(first) and w(last):         # full name
+            return True
+        for n in {first, last}:
+            if len(n) < 3:
+                continue
+            if (f"for {n}" in tl or f"{n}'s" in tl or f"{n}’s" in tl
+                    or f"on behalf of {n}" in tl or f"@{n}" in tl
+                    or re.match(r"\s*" + re.escape(n) + r"\s*[:,\-—]", tl)):
+                return True
+        return False
 
     def resolve_cardholder(sender_uid, text):
-        """Sender's own DM = their charges. But an admin naming another pal in the
-        message files on that pal's behalf."""
+        """Sender's own DM = their charges. An admin can file on another pal's
+        behalf, but ONLY when the message clearly names that pal (see _refers_to);
+        otherwise it's about the admin's own charges."""
         sender = slack_users.get(sender_uid)
         if sender_uid in admins and text:
             tl = text.lower()
-            named = {c for c in slack_users.values() if c != sender
-                     and (c.split()[0].lower() in tl or c.split()[-1].lower() in tl)}
+            named = {c for c in slack_users.values()
+                     if c != sender and _refers_to(c, tl)}
             if len(named) == 1:
                 return named.pop()
         return sender
@@ -145,6 +174,60 @@ def run(client_name: str, month: str):
                     ledger.mark_dm_processed(conn, e.get("ts"), slack_users.get(uid))
                 return
 
+        # Reimbursements. A DM starting with the trigger word ("reimburse") is a NEW
+        # out-of-pocket expense. A reply IN an existing reimbursement's thread needs
+        # no trigger word — Penny remembers that charge and fills in what's new (so
+        # nobody re-sends or re-uploads a receipt). The card flow stays untouched:
+        # only trigger-word DMs and replies under a reimbursement thread are caught.
+        rc = cfg.section("reimbursements")
+        trigger = (rc.get("trigger") or "reimburse").lower()
+        starts_trigger = bool(rc.get("enabled")) and text.strip().lower().startswith(trigger)
+        employee = slack_users.get(uid)
+        participants = set(rc.get("participants", []))
+        thread_ts = e.get("thread_ts")
+
+        # A non-participant tried the trigger word -> pilot notice (don't card-route it).
+        if starts_trigger and (not employee or employee not in participants):
+            conn = ledger.open_db(db_path)
+            penny.send_dm(uid, "Reimbursements through Penny are in a limited pilot "
+                          "right now — please keep using Expensify for now. (Ping Erica "
+                          "to join the pilot.)", thread_ts=e.get("ts"))
+            ledger.mark_dm_processed(conn, e.get("ts"), employee)
+            return
+
+        if rc.get("enabled") and employee in participants and (starts_trigger or thread_ts):
+            conn = ledger.open_db(db_path)
+            followup_ext = f"reimb-{thread_ts}" if thread_ts else None
+            is_followup = bool(not starts_trigger and followup_ext
+                               and ledger.reimbursement_by_external_id(
+                                   conn, cfg.client, followup_ext))
+            if starts_trigger or is_followup:
+                if not ledger.claim_dm(conn, e.get("ts"), employee):
+                    _log(f"[skip] {employee}: reimbursement msg already claimed (dup)")
+                    return
+                file_ids = [f["id"] for f in e.get("files", []) if f.get("id")]
+                try:
+                    if starts_trigger:
+                        _log(f"[reimburse] {employee} intake: {text[:60]!r} "
+                             f"+ {len(file_ids)} file(s)")
+                        res = reimburse_flow.process_intake(
+                            conn, cfg, employee, uid, text, active_month(),
+                            slack=penny, file_ids=file_ids, source_dm_ts=e.get("ts"))
+                        penny.send_dm(uid, res["confirm_back"], thread_ts=e.get("ts"))
+                    else:
+                        _log(f"[reimburse] {employee} follow-up in {followup_ext}: "
+                             f"{text[:50]!r} + {len(file_ids)} file(s)")
+                        res = reimburse_flow.process_followup(
+                            conn, cfg, employee, uid, text, active_month(),
+                            slack=penny, file_ids=file_ids, thread_ts=thread_ts)
+                        penny.send_dm(uid, res["confirm_back"], thread_ts=thread_ts)
+                    _log(f"[reimburse] {employee}: {res['status']}")
+                except Exception:
+                    ledger.unclaim_dm(conn, e.get("ts"))
+                    _log(f"[error] reimbursement {employee}: {traceback.format_exc()}")
+                return
+            # participant replied in a NON-reimbursement thread -> card path below
+
         cardholder = resolve_cardholder(uid, text)
         if not cardholder:
             _log(f"[skip] DM from unmapped user {uid}")
@@ -152,15 +235,18 @@ def run(client_name: str, month: str):
         file_ids = [f["id"] for f in e.get("files", []) if f.get("id")]
         on_behalf = " (on behalf, by admin)" if slack_users.get(uid) != cardholder else ""
         _log(f"[reply] {cardholder}{on_behalf}: {text[:70]!r} + {len(file_ids)} file(s)")
+        conn = ledger.open_db(db_path)   # fresh connection on this worker thread
+        if not ledger.claim_dm(conn, e.get("ts"), cardholder):
+            _log(f"[skip] {cardholder}: message already claimed (dup event)")
+            return
         try:
-            conn = ledger.open_db(db_path)   # fresh connection on this worker thread
             res = reply_flow.process_pal_reply(conn, cfg, cardholder, text, active_month(),
                                                slack=penny, file_ids=file_ids)
             penny.send_dm(uid, res["confirm_back"], thread_ts=e.get("ts"))
-            ledger.mark_dm_processed(conn, e.get("ts"), cardholder)
             _log(f"[done] {cardholder}: {res['decisions']} billable/project, "
                  f"{res['recats']} recat, {res['receipts']} receipt(s); confirm-back sent")
         except Exception:
+            ledger.unclaim_dm(conn, e.get("ts"))   # allow a retry
             _log(f"[error] processing {cardholder}: {traceback.format_exc()}")
 
     # Self-heal: process any DMs that arrived while Penny was offline (Socket Mode
@@ -190,6 +276,30 @@ def run(client_name: str, month: str):
             time.sleep(1800)   # re-check every 30 min
 
     threading.Thread(target=digest_loop, daemon=True).start()
+
+    # Continuous close: poll QBO for newly-posted charges (enrolled cardholders),
+    # categorize + book + DM them as they happen — a steady drip, not a month-end
+    # burst. Uses the current calendar month (that's when new charges post).
+    cc = cfg.raw.get("continuous_close", {})
+    if cc.get("cardholders"):
+        interval = int(cc.get("poll_hours", 4)) * 3600
+
+        def continuous_loop():
+            import datetime as _dt
+            while True:
+                try:
+                    cur_month = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m")
+                    conn = ledger.open_db(db_path)
+                    res = cc_mod.run_once(conn, cfg, penny, cur_month, post=True, log=_log)
+                    if res.get("new"):
+                        _log(f"[continuous] {res['new']} new charge(s) booked + DM'd: {res.get('pals')}")
+                except Exception:
+                    _log(f"[continuous] error: {traceback.format_exc()}")
+                time.sleep(interval)
+
+        threading.Thread(target=continuous_loop, daemon=True).start()
+        _log(f"[continuous] rolling close enabled for {cc['cardholders']} "
+             f"(every {cc.get('poll_hours', 4)}h)")
 
     sm.socket_mode_request_listeners.append(handle)
     sm.connect()

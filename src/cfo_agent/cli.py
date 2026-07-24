@@ -444,6 +444,18 @@ def cmd_penny_listen(args):
     return 0
 
 
+def cmd_penny_poll(args):
+    """Continuous close: process newly-posted card charges for enrolled
+    cardholders (categorize + write to QBO + DM). --post to act, else dry-run."""
+    from .adapters.slack_client import PennySlack
+    from .engine import continuous_close
+    cfg = load_client(args.client)
+    conn = ledger.open_db(RUNS_LOCAL / cfg.client / "ledger.sqlite3")
+    res = continuous_close.run_once(conn, cfg, PennySlack(), args.month, post=args.post)
+    print(res)
+    return 0
+
+
 def cmd_penny_catchup(args):
     """Process any DMs Penny missed while offline (safe to re-run)."""
     from .adapters.slack_client import PennySlack
@@ -456,6 +468,228 @@ def cmd_penny_catchup(args):
         print("no missed messages")
     for pal, n in done:
         print(f"  {pal}: {n} message(s) processed{'' if args.post else ' (dry-run, not sent)'}")
+    return 0
+
+
+def _payment_rail(cfg: ClientConfig):
+    """Construct the configured reimbursement payment rail (client-agnostic)."""
+    from .adapters.payment import build_rail
+    return build_rail(cfg)
+
+
+def cmd_reimburse_intake(args):
+    """Create a reimbursement from the CLI (test / on-behalf). Explicit fields,
+    not NLP. --file stores a local receipt; --slack-file has Penny fetch it.
+    Dry-run unless --commit."""
+    from .engine import reimburse_flow, receipt_store
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    rc = cfg.section("reimbursements")
+    amount_cents = round(float(args.amount) * 100) if args.amount else None
+    expense_date = args.date or reimburse_flow._today()
+    coa = args.coa   # no silent default — category is required (see missing check)
+    receipt_status = receipt_link = None
+    tmp = None
+    if args.slack_file:
+        from .adapters.slack_client import PennySlack
+        tmp = Path(tempfile.mktemp())
+        PennySlack().download_file(args.slack_file, tmp)
+    elif args.file:
+        tmp = Path(args.file)
+    if tmp and tmp.exists():
+        pseudo = {"merchant_raw": args.purpose or "reimbursement",
+                  "amount_cents": amount_cents or 0, "txn_date": expense_date}
+        dest = receipt_store.store_file(cfg, args.month, args.employee, pseudo, tmp)
+        receipt_status, receipt_link = "stored", str(dest)
+        if args.slack_file:
+            tmp.unlink(missing_ok=True)
+    missing = []
+    if amount_cents is None:
+        missing.append("amount")
+    if not args.purpose:
+        missing.append("business_purpose")
+    if rc.get("category_required", True) and not coa:
+        missing.append("category")
+    if rc.get("receipt_required", True) and receipt_status != "stored":
+        missing.append("receipt")
+    ext = f"reimb-cli-{args.employee.split()[0].lower()}-{expense_date}-{amount_cents}"
+    row = {"external_id": ext, "client": cfg.client,
+           "entity": cfg.raw.get("entity") or "August", "employee": args.employee,
+           "kind": "one_off", "expense_date": expense_date, "close_month": args.month,
+           "amount_cents": amount_cents or 0, "business_purpose": args.purpose,
+           "proposed_coa_line": coa, "receipt_status": receipt_status,
+           "receipt_link": receipt_link,
+           "status": "needs_info" if missing else "submitted"}
+    if not args.commit:
+        print("(dry-run — add --commit to save)")
+        print(f"  {args.employee}: ${(amount_cents or 0)/100:.2f} {expense_date} "
+              f"[{coa}] — {args.purpose or '(no purpose)'}; receipt={receipt_status or 'none'}")
+        if missing:
+            print(f"  would be needs_info (missing: {', '.join(missing)})")
+        return 0
+    rid = ledger.create_reimbursement(conn, row)
+    ledger.record_reimbursement_event(conn, cfg.client, ext, row["status"],
+                                      {"missing": missing}, actor=args.employee, source="cli")
+    print(f"reimbursement #{rid} created — status {row['status']}"
+          + (f" (missing: {', '.join(missing)})" if missing else ""))
+    return 0
+
+
+def cmd_reimburse_list(args):
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    rows = ledger.reimbursements_for(conn, cfg.client, args.month, status=args.status)
+    if not rows:
+        print("no reimbursements")
+        return 0
+    for r in rows:
+        print(f"  #{r['id']:>4} {r['status']:<10} {r['employee']:<18} "
+              f"${r['amount_cents']/100:>9,.2f} {r.get('expense_date') or '':<10} "
+              f"[{r.get('proposed_coa_line') or '—'}] {r.get('business_purpose') or ''}")
+    print(f"\n{len(rows)} reimbursement(s)")
+    return 0
+
+
+def cmd_reimburse_approve(args):
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    row = ledger.reimbursement_by_id(conn, args.id)
+    if not row:
+        print(f"no reimbursement #{args.id}")
+        return 1
+    approver = args.approver or reimburse_flow.approver_for(cfg, row["employee"])
+    try:
+        fresh = reimburse_flow.approve(conn, cfg, args.id, approver)
+    except PermissionError as ex:
+        print(f"refused: {ex}")
+        return 1
+    print(f"approved #{fresh['id']} by {fresh['approver']} — status {fresh['status']}")
+    return 0
+
+
+def cmd_reimburse_reject(args):
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    fresh = reimburse_flow.reject(conn, cfg, args.id, args.reason or "rejected", actor="cli")
+    print(f"rejected #{fresh['id']}: {args.reason or 'rejected'}")
+    return 0
+
+
+def cmd_reimburse_export(args):
+    """Prepare the Justworks payout for approved reimbursements. Shows the
+    copy-paste text; --post marks them exported and writes the CSV artifact."""
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    approved = ledger.reimbursements_for(conn, cfg.client, args.month, status="approved")
+    if not approved:
+        print("nothing approved to export")
+        return 0
+    rail = _payment_rail(cfg)
+    if not args.post:
+        result = rail.pay_batch(approved, pay_date=args.pay_date)   # preview — no DB writes
+        print("(dry-run — add --post to mark exported + write the CSV)\n")
+        print(result.get("paste_text", ""))
+        return 0
+    res = reimburse_flow.export_payout(conn, cfg, [r["id"] for r in approved], rail,
+                                       pay_date=args.pay_date)
+    result = res["result"]
+    print(f"exported {len(res['reimbursements'])} reimbursement(s) — ref {result.get('ref')}")
+    if result.get("artifact"):
+        print(f"CSV: {result['artifact']}")
+    print("\n----- copy-paste for Justworks -----")
+    print(result.get("paste_text", ""))
+    return 0
+
+
+def cmd_reimburse_mark_paid(args):
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    ids = [args.id] if args.id else [
+        r["id"] for r in ledger.reimbursements_for(conn, cfg.client, args.month, status="exported")]
+    if not ids:
+        print("nothing exported to mark paid")
+        return 0
+    if not args.post:
+        print(f"(dry-run — would mark {len(ids)} paid; add --post)")
+        return 0
+    paid = reimburse_flow.mark_paid(conn, cfg, ids, actor="cli")
+    print(f"marked {len(paid)} reimbursement(s) paid")
+    return 0
+
+
+def cmd_reimburse_post_bill(args):
+    """Create (or preview) the QBO Bill for one reimbursement. Dry-run unless
+    --post. Run WITH DATABASE_URL so the QBO token comes from Postgres kv."""
+    import json as _json
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    res = reimburse_flow.bill_reimbursement(conn, cfg, args.id, post=args.post)
+    if not res["ok"]:
+        print("cannot bill: " + "; ".join(res.get("problems") or ["unknown"]))
+        return 1
+    r = res["reimb"]
+    print(f"reimbursement #{r['id']}  {r['employee']}  ${r['amount_cents']/100:.2f}  "
+          f"[{r.get('proposed_coa_line')}]  {r.get('expense_date')}")
+    print(f"  vendor: {res['vendor_name']} (QBO id {res['vendor_id']})")
+    print(f"  expense GL id {res['gl_id']}  ·  payable/clearing acct id {res['ap_account_id']}")
+    print("  --- QBO Bill payload ---")
+    print(_json.dumps(res["payload"], indent=2))
+    if args.post:
+        print(f"\nPOSTED ✅  QBO Bill Id {res.get('bill_id')}")
+    else:
+        print("\n(dry-run — add --post to create this Bill in QBO)")
+    return 0
+
+
+def cmd_reimburse_pay_bill(args):
+    """Create (or preview) the Bill Payment that marks a reimbursement's Bill paid,
+    crediting the 1345 reimbursement clearing account. Dry-run unless --post."""
+    import json as _json
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    res = reimburse_flow.pay_bill_reimbursement(conn, cfg, args.id, post=args.post)
+    if not res["ok"]:
+        print("cannot pay: " + "; ".join(res.get("problems") or ["unknown"]))
+        return 1
+    r = res["reimb"]
+    print(f"reimbursement #{r['id']}  {r['employee']}  ${r['amount_cents']/100:.2f}  "
+          f"— QBO Bill {r.get('qbo_bill_id')}")
+    print(f"  BillPayment credits clearing acct id {res['clearing_account_id']} (1345)")
+    print("  --- BillPayment payload ---")
+    print(_json.dumps(res["payload"], indent=2))
+    if args.post:
+        print(f"\nPOSTED ✅  QBO BillPayment Id {res.get('billpayment_id')}")
+    else:
+        print("\n(dry-run — add --post to create the Bill Payment in QBO)")
+    return 0
+
+
+def cmd_reimburse_stipends(args):
+    """Generate this month's recurring stipend reimbursements (idempotent).
+    Dry-run unless --post."""
+    from .engine import reimburse_flow
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    stipends = cfg.section("reimbursements").get("stipends", []) or []
+    if not stipends:
+        print("no stipends configured")
+        return 0
+    if not args.post:
+        print("(dry-run — add --post to create these)")
+        for st in stipends:
+            print(f"  {st.get('employee')}: ${st.get('amount_cents',0)/100:.2f} "
+                  f"{st.get('name')} [{st.get('coa_line')}]")
+        return 0
+    rows = reimburse_flow.generate_stipends(conn, cfg, args.month)
+    for r in rows:
+        print(f"  #{r['id']} {r['employee']}: {r['business_purpose']} — status {r['status']}")
+    print(f"\n{len(rows)} stipend row(s) for {args.month}")
     return 0
 
 
@@ -675,6 +909,64 @@ def main(argv=None):
     nd.add_argument("--force", action="store_true", help="post even past the first week")
     nd.set_defaults(fn=cmd_notify_digest)
 
+    reimb = sub.add_parser("reimburse", help="employee out-of-pocket reimbursements")
+    rsub = reimb.add_subparsers(dest="subcmd", required=True)
+    ri = rsub.add_parser("intake", help="create a reimbursement (test / on-behalf)")
+    ri.add_argument("--client", required=True)
+    ri.add_argument("--month", required=True, help="close month YYYY-MM")
+    ri.add_argument("--employee", required=True)
+    ri.add_argument("--amount", default=None, help="dollars, e.g. 42.50")
+    ri.add_argument("--purpose", default=None, help="one-line business purpose")
+    ri.add_argument("--date", default=None, help="expense date YYYY-MM-DD (default today)")
+    ri.add_argument("--coa", default=None, help="COA category (default: config default)")
+    ri.add_argument("--file", default=None, help="local receipt file to store")
+    ri.add_argument("--slack-file", default=None, help="Slack file id — Penny fetches it")
+    ri.add_argument("--commit", action="store_true", help="actually save (else dry-run)")
+    ri.set_defaults(fn=cmd_reimburse_intake)
+    rl = rsub.add_parser("list")
+    rl.add_argument("--client", required=True)
+    rl.add_argument("--month", default=None)
+    rl.add_argument("--status", default=None, help="filter by status")
+    rl.set_defaults(fn=cmd_reimburse_list)
+    ra = rsub.add_parser("approve", help="approve a reimbursement (enforces no self-approval)")
+    ra.add_argument("--client", required=True)
+    ra.add_argument("--id", type=int, required=True)
+    ra.add_argument("--approver", default=None, help="override the computed approver")
+    ra.set_defaults(fn=cmd_reimburse_approve)
+    rj = rsub.add_parser("reject")
+    rj.add_argument("--client", required=True)
+    rj.add_argument("--id", type=int, required=True)
+    rj.add_argument("--reason", default=None)
+    rj.set_defaults(fn=cmd_reimburse_reject)
+    re_ = rsub.add_parser("export", help="prepare the Justworks payout for approved items")
+    re_.add_argument("--client", required=True)
+    re_.add_argument("--month", required=True)
+    re_.add_argument("--pay-date", dest="pay_date", default=None,
+                     help="Justworks pay date (e.g. 07/31/2026; default today)")
+    re_.add_argument("--post", action="store_true", help="mark exported + write CSV (else preview)")
+    re_.set_defaults(fn=cmd_reimburse_export)
+    rmp = rsub.add_parser("mark-paid", help="flag exported reimbursements as paid")
+    rmp.add_argument("--client", required=True)
+    rmp.add_argument("--month", required=True)
+    rmp.add_argument("--id", type=int, default=None, help="one reimbursement (else all exported)")
+    rmp.add_argument("--post", action="store_true", help="actually mark paid (else dry-run)")
+    rmp.set_defaults(fn=cmd_reimburse_mark_paid)
+    rpb = rsub.add_parser("post-bill", help="create/preview the QBO Bill for a reimbursement")
+    rpb.add_argument("--client", required=True)
+    rpb.add_argument("--id", type=int, required=True)
+    rpb.add_argument("--post", action="store_true", help="create the Bill in QBO (else dry-run)")
+    rpb.set_defaults(fn=cmd_reimburse_post_bill)
+    rpp = rsub.add_parser("pay-bill", help="mark a reimbursement's Bill paid (offset to 1345 clearing)")
+    rpp.add_argument("--client", required=True)
+    rpp.add_argument("--id", type=int, required=True)
+    rpp.add_argument("--post", action="store_true", help="create the Bill Payment in QBO (else dry-run)")
+    rpp.set_defaults(fn=cmd_reimburse_pay_bill)
+    rst = rsub.add_parser("stipends", help="generate this month's recurring stipends")
+    rst.add_argument("--client", required=True)
+    rst.add_argument("--month", required=True)
+    rst.add_argument("--post", action="store_true", help="create them (else dry-run)")
+    rst.set_defaults(fn=cmd_reimburse_stipends)
+
     vault = sub.add_parser("vault")
     vsub = vault.add_subparsers(dest="subcmd", required=True)
     s = vsub.add_parser("smoke")
@@ -701,6 +993,11 @@ def main(argv=None):
     pc.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
     pc.add_argument("--post", action="store_true", help="send confirm-backs (else dry-run)")
     pc.set_defaults(fn=cmd_penny_catchup)
+    pp = psub.add_parser("poll", help="continuous close: process newly-posted charges")
+    pp.add_argument("--client", required=True)
+    pp.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
+    pp.add_argument("--post", action="store_true", help="categorize+write+DM (else dry-run)")
+    pp.set_defaults(fn=cmd_penny_poll)
 
     db_p = sub.add_parser("db")
     dbsub = db_p.add_subparsers(dest="subcmd", required=True)

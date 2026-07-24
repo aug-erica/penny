@@ -20,7 +20,7 @@ bot:
   review_workbook_url:
     "2026-06": "https://drive.google.com/file/d/1L_6SZ8DZdqaU-vP-ekVGO_1W7GnQ2yjI/view"
   # Admins who can file/act on behalf of another pal (by naming them in the DM).
-  admins: ["U094H9WBE", "U09MANP29UP"]   # Erica, Purvi
+  admins: ["U094H9WBE", "U09MANP29UP", "U03H12QHUAW"]   # Erica, Purvi, Natalie (Skyfin bookkeeper — acts on behalf of pals)
   # Slack user id -> cardholder, so the listener maps a DM sender to their charges.
   slack_users:
     U094TAG23: "Mike Arauz"
@@ -33,6 +33,13 @@ bot:
     U0AGMQ2KW: "Jessie Punia"
     U09MANP29UP: "Purvi Patel"
     U094H9WBE: "Erica Seldin"
+    U04T4MPJDDJ: "Melissa Shamis"
+    UPDU3SRN0: "Keara Mascareñas"
+    # The Finance / AP card has no human cardholder — Natalie (Skyfin bookkeeper)
+    # is its owner-of-record, so its drip DMs go to her and her replies default to
+    # AP-card charges. She's also in `admins`, so she can still act on any other
+    # pal's behalf by naming them (admin path wins when a pal is named).
+    U03H12QHUAW: "Finance / AP Card"
 
 data_root: "/Users/ericaseldin/Library/CloudStorage/GoogleDrive-erica@aug.co/Shared drives/August Brain/06_Operations/CFO Agent"
 close_data_dir: "2026 Month End Close"   # relative to data_root
@@ -40,6 +47,30 @@ runs_dir: "runs"                          # relative to data_root; review artifa
 
 # Card last-4 -> cardholder. Used by CSV/feed adapters that carry only the card
 # number (statements carry the name inline). From the Chase Employees list.
+# Rolling ("continuous") close: Penny polls QBO for newly-posted card charges for
+# these cardholders, categorizes + books each on the spot, and DMs them to
+# confirm + collect a receipt — a steady drip instead of a month-end burst.
+# FULL TEAM (rolled out July 13, 2026 — was Erica+Purvi prototype). Every real
+# cardholder is enrolled, plus the "Finance / AP Card" whose drip DMs route to
+# Natalie (its owner-of-record; see her slack_users mapping above).
+# A cardholder only gets a drip DM if they're in bot.slack_users above.
+continuous_close:
+  cardholders:
+    - "Erica Seldin"
+    - "Purvi Patel"
+    - "Mike Arauz"
+    - "Alexis Black"
+    - "Samantha Lozzi"
+    - "Levi Baer"
+    - "Michael Burkin"
+    - "Tirzah Enumah"
+    - "Karina Mangu-Ward"
+    - "Jessie Punia"
+    - "Melissa Shamis"
+    - "Keara Mascareñas"
+    - "Finance / AP Card"
+  poll_hours: 4
+
 cardholders:
   "8303": "Erica Seldin"          # main account card
   "9768": "Alexis Black"
@@ -102,6 +133,110 @@ billable:
   # pull logic + the "closedwon"-stage gotcha live in
   # adapters/projects/hubspot_projects.py. Headless refresh needs HUBSPOT_TOKEN.
   billable_projects_file: "active_projects.yaml"
+
+# Employee out-of-pocket REIMBURSEMENTS (moving off Expensify). An employee DMs
+# Penny a message starting with the trigger word ("reimburse $42 client lunch")
+# + a receipt; Penny logs it, Purvi approves it in the dashboard queue, and Penny
+# produces a copy-paste Justworks payout summary a human enters in Justworks.
+# v1 = a 3-person pilot, parallel to Expensify. Gated by `participants` (mirrors
+# continuous_close.cardholders).
+reimbursements:
+  enabled: true
+  trigger: "reimburse"
+  receipt_required: true                 # accountable-plan: receipt is mandatory
+  category_required: true                # employees must state the COA category (these
+                                         # aren't payroll-tagged — Skyfin books them like
+                                         # card expenses), so we ask for it at intake
+  participants:                          # pilot — the only people Penny accepts intake from
+    - "Erica Seldin"
+    - "Purvi Patel"
+    - "Keara Mascareñas"                 # August's reimbursement beta tester / power user
+  approver:
+    primary: "Purvi Patel"              # falls back to reviewer.primary
+    secondary: "Erica Seldin"           # approves Purvi's own submissions (no self-approval)
+  # Employee -> Justworks identity. work_email is the key the Justworks bulk-upload
+  # template matches on; member_id is from list_members (future automation).
+  justworks_members:
+    "Erica Seldin": {work_email: "erica@aug.co", member_id: "member_019x65xyh85gab0gkfys615apb"}
+    "Purvi Patel": {work_email: "purvi@aug.co", member_id: "member_01k83xmm2fz7n3rwy4ytcw2m8f"}
+    "Keara Mascareñas": {work_email: "keara@aug.co", member_id: "member_01ehdcjx0ge98jj7c9w91zn1p3"}
+  payment:
+    type: "justworks_manual"            # manual for v1: Penny prepares, a human pays in Justworks
+  # QBO booking (Natalie/Skyfin, final structure July 2026): on APPROVAL Penny
+  # creates a Bill (vendor = employee) with the expense line coded to the ACTUAL
+  # category GL and the normal A/P as payable  -> DR category / CR A/P (proper P&L
+  # categorization). When the Bill is marked paid, the offset goes to 1345 Employee
+  # Reimbursement Clearing (Other Current Asset), NOT a bank -> DR A/P / CR 1345.
+  # Justworks also posts the reimbursement to 1345, so the two offset and 1345 nets
+  # to ~zero (no double-count). employee -> exact QBO Vendor DisplayName (varies;
+  # do not fuzzy). NOTE: a QBO Bill Payment's funding account must be Bank/Credit
+  # Card type; 1345 is Other Current Asset, so crediting it via the BillPayment API
+  # may be rejected — being verified with Natalie (fallback: type 1345 as Bank, or
+  # clear A/P->1345 with a Journal Entry).
+  qbo:
+    ap_account_id: "59"                       # Accounts Payable (A/P) 2000 — Bill payable side
+    reimbursement_clearing_account_id: "231"  # 1345 Employee Reimbursement Clearing — bill-payment offset
+    vendors:
+      "Erica Seldin": "erica@aug.co"
+      "Mike Arauz": "Mike Arauz"
+      "Jessie Punia": "Jessie Punia"
+      "Alexis Black": "Alexis Gonzales-Black"
+      "Karina Mangu-Ward": "Karina Mangu-Ward"
+      "Tirzah Enumah": "tirzah@aug.co"
+      "Levi Baer": "levi@aug.co"
+      "Keara Mascareñas": "Keara Mascarenaz"
+      "Melissa Shamis": "melissa@aug.co"
+      "Samantha Lozzi": "Sam Lozzi"
+      "Purvi Patel": "purvi@aug.co"
+      "Michael Burkin": "michaelb@aug.co"
+  # Policy caps from the Employment Benefits doc (Aug 2025). Penny pushes back
+  # (warns the employee + flags for Purvi) when a submission is over a cap or stale
+  # — never a hard block (the policy has exceptions, e.g. international-travel cell
+  # costs beyond $100, so the reviewer decides). First matching limit wins, so list
+  # specific items before general ones. Amounts in cents.
+  policy:
+    max_age_days: 90                    # general rule: submit within 90 days of purchase
+    limits:
+      - name: "Home internet"
+        period: "month"
+        limit_cents: 5000               # $50/mo
+        keywords: ["internet", "wifi", "wi-fi", "broadband", "comcast", "xfinity",
+                   "spectrum", "fios", "optimum", "verizon fios"]
+      - name: "Cell phone equipment"
+        period: "month"
+        limit_cents: 5000               # $50/mo ($600/yr) toward hardware
+        keywords: ["phone equipment", "phone hardware", "new phone", "iphone",
+                   "handset", "device payment", "phone payment"]
+      - name: "Cell phone service"
+        period: "month"
+        limit_cents: 10000              # $100/mo service + data (intl client travel exempt)
+        keywords: ["cell", "mobile", "data plan", "phone bill", "phone plan",
+                   "at&t", "att", "t-mobile", "tmobile", "sprint", "verizon", "phone"]
+      - name: "Work travel (non-billable)"
+        period: "month"
+        limit_cents: 12700              # $127/mo commuting/rideshare
+        coa: "General Travel"
+        keywords: ["metrocard", "metro card", "mta", "subway", "commute", "rideshare",
+                   "ride share", "uber", "lyft", "taxi", "citi bike", "citibike"]
+      - name: "Home office setup"
+        period: "one-time (year 1)"
+        limit_cents: 100000             # $1,000 one-time
+        coa: "Office Supplies (NY & Home)"
+        keywords: ["monitor", "keyboard", "mouse", "laptop stand", "headphones",
+                   "desk chair", "standing desk", "home office"]
+      - name: "Professional development"
+        period: "trimester"
+        limit_cents: 70000              # $700/trimester
+        coa: "Professional Development"
+  # Recurring WiFi/cell stipends (Phase 3). Tax caveat: a fixed allowance without
+  # substantiation may be taxable — confirm treatment with Purvi/CPA before enabling.
+  stipends: []
+    # - name: "WiFi / Internet"
+    #   employee: "Keara Mascareñas"
+    #   amount_cents: 7500
+    #   coa_line: "Telephone & Internet"
+    #   cadence: "monthly"
+    #   receipt_required: false
 
 # Event windows encode calendar context the card feed can't carry: during an
 # in-person/Summit week or a launch push, ordinary food/travel/local spend is

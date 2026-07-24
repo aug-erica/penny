@@ -106,6 +106,72 @@ CREATE TABLE IF NOT EXISTS digest_posts (
 );
 """
 
+# Reimbursement tables kept in their OWN DDL block so open_db can create just these
+# on an already-migrated Postgres WITHOUT re-touching ledger_lines — an
+# ALTER/ADD COLUMN on the live ledger_lines takes an ACCESS EXCLUSIVE lock that
+# can't be acquired while the listener/dashboard are querying it (it times out and
+# rolls back the whole migration). These are all brand-new objects → no contention.
+REIMB_DDL = """
+-- Employee out-of-pocket REIMBURSEMENTS (the last thing leaving Expensify).
+-- Kept in its own table, NOT ledger_lines: reimbursements are employee-initiated,
+-- need human approval, and get PAID to a person — a different lifecycle
+-- (submitted -> approved/rejected -> exported -> paid) and its own payee identity.
+-- Overloading ledger_lines would force reimbursement branches through every card
+-- path and require relaxing its source/status CHECKs.
+CREATE TABLE IF NOT EXISTS reimbursements (
+  id                {PK},
+  external_id       TEXT NOT NULL UNIQUE,
+  client            TEXT NOT NULL,
+  entity            TEXT NOT NULL,
+  employee          TEXT NOT NULL,
+  submitter_uid     TEXT,
+  kind              TEXT NOT NULL DEFAULT 'one_off'
+                      CHECK (kind IN ('one_off','stipend')),
+  expense_date      TEXT NOT NULL,
+  close_month       TEXT NOT NULL,
+  submitted_at      TEXT NOT NULL,
+  amount_cents      INTEGER NOT NULL,
+  currency          TEXT NOT NULL DEFAULT 'USD',
+  business_purpose  TEXT,
+  proposed_coa_line TEXT,
+  receipt_status    TEXT,
+  receipt_link      TEXT,
+  status            TEXT NOT NULL DEFAULT 'submitted'
+                      CHECK (status IN ('submitted','needs_info','approved','rejected','exported','paid')),
+  approver          TEXT,
+  approved_at       TEXT,
+  rejected_reason   TEXT,
+  payment_rail      TEXT,
+  payout_ref        TEXT,
+  exported_at       TEXT,
+  paid_at           TEXT,
+  qbo_vendor_id     TEXT,
+  qbo_bill_id       TEXT,
+  source_dm_ts      TEXT,
+  rationale         TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reimb_month ON reimbursements(client, close_month, status);
+CREATE INDEX IF NOT EXISTS idx_reimb_emp ON reimbursements(client, employee);
+-- Append-only audit journal for reimbursements (parallel to `decisions`, kept
+-- separate so apply_decisions never tries to replay these onto ledger_lines).
+CREATE TABLE IF NOT EXISTS reimbursement_events (
+  id                {PK},
+  client            TEXT NOT NULL,
+  reimb_external_id TEXT NOT NULL,
+  event             TEXT NOT NULL,
+  detail_json       TEXT,
+  actor             TEXT,
+  source            TEXT,
+  at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reimb_events ON reimbursement_events(client, reimb_external_id);
+"""
+
+# Full schema = base tables + reimbursement tables (fresh DBs run all of it).
+DDL = DDL + REIMB_DDL
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -123,6 +189,27 @@ def mark_dm_processed(conn, ts: str, cardholder: str = None):
 
 def processed_dm_ts(conn) -> set:
     return {r["ts"] for r in conn.execute("SELECT ts FROM processed_dm")}
+
+
+def claim_dm(conn, ts: str, cardholder: str = None) -> bool:
+    """Atomically claim a message for processing. Returns True if THIS caller
+    claimed it (go process), False if it was already claimed (skip). Prevents
+    double-processing when a rolling deploy briefly runs two listeners that both
+    receive the same Slack event."""
+    if conn.is_pg:
+        cur = conn.execute("INSERT INTO processed_dm(ts, cardholder, processed_at) "
+                           "VALUES (?,?,?) ON CONFLICT (ts) DO NOTHING", (ts, cardholder, now()))
+    else:
+        cur = conn.execute("INSERT OR IGNORE INTO processed_dm(ts, cardholder, processed_at) "
+                           "VALUES (?,?,?)", (ts, cardholder, now()))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def unclaim_dm(conn, ts: str):
+    """Release a claim so the message can be retried (call if processing threw)."""
+    conn.execute("DELETE FROM processed_dm WHERE ts=?", (ts,))
+    conn.commit()
 
 
 def upsert_learned_rule(conn, client: str, merchant_norm: str, coa_line: str,
@@ -159,12 +246,53 @@ def mark_digest_posted(conn, client: str, close_month: str, post_date: str):
     conn.commit()
 
 
+_SCHEMA_READY = set()   # backends whose schema this process has already ensured
+
+
 def open_db(path) -> db.Conn:
     conn = db.connect(path)
+    # Ensure schema ONCE per process (not per call): a web service opens a fresh
+    # connection per request, and re-running CREATE/ALTER DDL each time serializes
+    # on schema locks and times out workers. First connection sets it up.
+    key = "pg" if conn.is_pg else str(path)
+    if key in _SCHEMA_READY:
+        return conn
     pk = "BIGSERIAL PRIMARY KEY" if conn.is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    if conn.is_pg:
+        try:
+            conn.execute("SET lock_timeout='5s'")   # never hang a worker on DDL
+        except Exception:
+            pass
+        # Fully migrated? `reimbursements` is the newest object — its presence means
+        # skip ALL DDL (a CREATE/ALTER takes locks that fight the live listener).
+        try:
+            if conn.execute("SELECT 1 FROM information_schema.tables WHERE "
+                            "table_name='reimbursements'").fetchone():
+                _SCHEMA_READY.add(key)
+                return conn
+        except Exception:
+            pass
+        # Base schema present (billable_note exists) but reimbursements missing:
+        # create ONLY the new tables. CRUCIAL — do NOT re-run the ledger_lines
+        # ADD COLUMN loop here: those columns already exist and the ALTER needs an
+        # ACCESS EXCLUSIVE lock that can't be taken while the table is being read,
+        # so it times out and rolls back the whole migration (the reimbursements
+        # CREATE included). The new tables are brand-new objects → no contention.
+        try:
+            has_base = conn.execute(
+                "SELECT 1 FROM information_schema.columns WHERE "
+                "table_name='ledger_lines' AND column_name='billable_note'").fetchone()
+        except Exception:
+            has_base = None
+        if has_base:
+            conn.executescript(REIMB_DDL.replace("{PK}", pk))
+            conn.commit()
+            _SCHEMA_READY.add(key)
+            return conn
+    # Fresh DB (or any SQLite): full schema + additive column migrations.
     conn.executescript(DDL.replace("{PK}", pk))
-    # Additive migrations for DBs created before a column existed.
-    for col, decl in (("project", "TEXT"), ("receipt_status", "TEXT")):
+    for col, decl in (("project", "TEXT"), ("receipt_status", "TEXT"),
+                      ("billable_note", "TEXT")):
         if conn.is_pg:
             conn.execute(f"ALTER TABLE ledger_lines ADD COLUMN IF NOT EXISTS {col} {decl}")
         else:
@@ -173,6 +301,7 @@ def open_db(path) -> db.Conn:
             except sqlite3.OperationalError:
                 pass  # already present
     conn.commit()
+    _SCHEMA_READY.add(key)
     return conn
 
 
@@ -255,6 +384,10 @@ def set_match(conn, line_id: int, matched_line_id: int, score: float,
 
 def set_proposal(conn, line_id: int, coa_line: str, proposed_by: str,
                  confidence: str, rationale: str, billable=None, status: str = None):
+    # billable is an INTEGER column; a rule may hand us a Python bool, which
+    # Postgres refuses to COALESCE against an integer (SQLite is lenient). Coerce.
+    if isinstance(billable, bool):
+        billable = int(billable)
     conn.execute(
         """UPDATE ledger_lines SET proposed_coa_line=?, proposed_by=?, confidence=?,
            rationale=?, billable=COALESCE(?, billable),
@@ -297,6 +430,14 @@ def set_billable_project(conn, line_id: int, billable, project=None):
     conn.execute(
         "UPDATE ledger_lines SET billable=?, project=?, updated_at=? WHERE id=?",
         (billable, project, now(), line_id))
+    conn.commit()
+
+
+def set_billable_note(conn, line_id: int, note: str):
+    """One-line description of a billable expense, for Natalie to put on invoices
+    (what Expensify captured natively)."""
+    conn.execute("UPDATE ledger_lines SET billable_note=?, updated_at=? WHERE id=?",
+                 (note, now(), line_id))
     conn.commit()
 
 
@@ -473,3 +614,144 @@ def history_detail(conn, client: str, merchant_norm: str) -> list:
            ORDER BY close_month DESC, n DESC""",
         (client, merchant_norm),
     )]
+
+
+# --- Employee reimbursements ------------------------------------------------
+
+# Columns a caller may set on create_reimbursement (besides the always-required
+# ones), so the insert stays explicit and dialect-portable.
+_REIMB_COLS = (
+    "external_id", "client", "entity", "employee", "submitter_uid", "kind",
+    "expense_date", "close_month", "submitted_at", "amount_cents", "currency",
+    "business_purpose", "proposed_coa_line", "receipt_status", "receipt_link",
+    "status", "source_dm_ts", "rationale",
+)
+# Fields set_reimbursement_status may update (whitelist — never interpolate keys
+# from callers without this guard).
+_REIMB_STATUS_FIELDS = frozenset({
+    "approver", "approved_at", "rejected_reason", "payment_rail", "payout_ref",
+    "exported_at", "paid_at", "qbo_vendor_id", "qbo_bill_id", "proposed_coa_line",
+    "rationale",
+})
+
+
+def create_reimbursement(conn, r: dict) -> int:
+    """Idempotent insert keyed on external_id. Returns the row id (existing or new)."""
+    existing = conn.execute(
+        "SELECT id FROM reimbursements WHERE external_id=?", (r["external_id"],)
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    ts = now()
+    vals = {
+        "currency": "USD", "kind": "one_off", "status": "submitted",
+        "submitted_at": ts, **{k: r.get(k) for k in _REIMB_COLS if k in r},
+    }
+    vals["submitted_at"] = vals.get("submitted_at") or ts
+    cols = list(vals.keys()) + ["created_at", "updated_at"]
+    placeholders = ",".join(["?"] * len(cols))
+    args = [vals[c] for c in vals] + [ts, ts]
+    new_id = conn.insert_returning_id(
+        f"INSERT INTO reimbursements ({','.join(cols)}) VALUES ({placeholders})",
+        tuple(args), "id")
+    conn.commit()
+    return new_id
+
+
+def reimbursement_by_external_id(conn, client: str, external_id: str):
+    r = conn.execute(
+        "SELECT * FROM reimbursements WHERE client=? AND external_id=?",
+        (client, external_id)).fetchone()
+    return dict(r) if r else None
+
+
+def reimbursement_by_id(conn, reimb_id: int):
+    r = conn.execute("SELECT * FROM reimbursements WHERE id=?", (reimb_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def reimbursements_for(conn, client: str, month: str = None,
+                       status=None) -> list:
+    """List reimbursements for a client, optionally filtered by close_month and
+    status (a single status string or an iterable of statuses)."""
+    q = "SELECT * FROM reimbursements WHERE client=?"
+    args = [client]
+    if month:
+        q += " AND close_month=?"
+        args.append(month)
+    if status:
+        statuses = [status] if isinstance(status, str) else list(status)
+        q += f" AND status IN ({','.join(['?'] * len(statuses))})"
+        args.extend(statuses)
+    return [dict(r) for r in conn.execute(q + " ORDER BY submitted_at, id", args)]
+
+
+def set_reimbursement_status(conn, reimb_id: int, status: str, **fields):
+    """Set status plus any whitelisted lifecycle fields (approver, approved_at,
+    payout_ref, exported_at, paid_at, …). Ignores unknown keys defensively."""
+    sets = ["status=?", "updated_at=?"]
+    args = [status, now()]
+    for k, v in fields.items():
+        if k in _REIMB_STATUS_FIELDS:
+            sets.append(f"{k}=?")
+            args.append(v)
+    args.append(reimb_id)
+    conn.execute(f"UPDATE reimbursements SET {','.join(sets)} WHERE id=?", tuple(args))
+    conn.commit()
+
+
+_REIMB_EDIT_FIELDS = frozenset({
+    "amount_cents", "business_purpose", "proposed_coa_line", "expense_date",
+})
+
+
+def update_reimbursement_fields(conn, reimb_id: int, **fields):
+    """Fill/correct intake data fields on an in-flight reimbursement (thread
+    follow-up). Whitelisted; ignores unknown keys and None values (never nulls out
+    an existing value)."""
+    sets, args = [], []
+    for k, v in fields.items():
+        if k in _REIMB_EDIT_FIELDS and v is not None:
+            sets.append(f"{k}=?")
+            args.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    args.append(now())
+    args.append(reimb_id)
+    conn.execute(f"UPDATE reimbursements SET {','.join(sets)} WHERE id=?", tuple(args))
+    conn.commit()
+
+
+def set_reimbursement_receipt(conn, reimb_id: int, status: str, link: str = None):
+    conn.execute(
+        """UPDATE reimbursements SET receipt_status=?,
+           receipt_link=COALESCE(?, receipt_link), updated_at=? WHERE id=?""",
+        (status, link, now(), reimb_id))
+    conn.commit()
+
+
+def set_reimbursement_coa(conn, reimb_id: int, coa_line: str):
+    """Reviewer edits the proposed category on a reimbursement (dashboard)."""
+    conn.execute(
+        "UPDATE reimbursements SET proposed_coa_line=?, updated_at=? WHERE id=?",
+        (coa_line, now(), reimb_id))
+    conn.commit()
+
+
+def record_reimbursement_event(conn, client: str, reimb_external_id: str,
+                               event: str, detail: dict = None,
+                               actor: str = None, source: str = None):
+    """Append one entry to the reimbursement audit journal (never updated/deleted)."""
+    conn.execute(
+        "INSERT INTO reimbursement_events (client, reimb_external_id, event, "
+        "detail_json, actor, source, at) VALUES (?,?,?,?,?,?,?)",
+        (client, reimb_external_id, event,
+         json.dumps(detail or {}), actor, source, now()))
+    conn.commit()
+
+
+def reimbursement_events(conn, client: str, reimb_external_id: str) -> list:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM reimbursement_events WHERE client=? AND reimb_external_id=? "
+        "ORDER BY id", (client, reimb_external_id))]
