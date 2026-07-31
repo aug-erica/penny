@@ -15,9 +15,10 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (db, ledger, receipt_read, receipt_store, reimburse_dm, reimburse_parse,
-               reimburse_policy)
+from . import (db, disambiguate, ledger, receipt_read, receipt_store, reimburse_dm,
+               reimburse_parse, reimburse_policy)
 from .continuous_close import _uid_for
+from .normalize import normalize_merchant
 
 
 def _qbo_enabled(cfg) -> bool:
@@ -59,36 +60,90 @@ def _dashboard_url() -> str:
 def _store_receipt(cfg, month, employee, purpose, amount_cents, expense_date,
                    slack, file_ids):
     """Download + store the first attached file as the receipt. Also fills a
-    missing amount from the receipt total. Returns (receipt_status, receipt_link,
-    amount_cents). No file -> (None, None, amount_cents unchanged)."""
+    missing amount from the receipt total and reads the merchant off the receipt
+    (used to sharpen the category proposal). Returns (receipt_status,
+    receipt_link, amount_cents, merchant). No file -> (None, None, amount_cents
+    unchanged, None)."""
     if not (slack and file_ids):
-        return None, None, amount_cents
+        return None, None, amount_cents, None
     tmp = Path(tempfile.mktemp())
     try:
         slack.download_file(file_ids[0], tmp)
         info = receipt_read.read_receipt(tmp)
         if amount_cents is None and info.get("amount_cents"):
             amount_cents = info["amount_cents"]
-        pseudo = {"merchant_raw": (purpose or "reimbursement"),
+        merchant = info.get("merchant") or None
+        pseudo = {"merchant_raw": (merchant or purpose or "reimbursement"),
                   "amount_cents": amount_cents or 0, "txn_date": expense_date}
         dest = receipt_store.store_file(cfg, month, employee, pseudo, tmp)
-        return "stored", str(dest), amount_cents
+        return "stored", str(dest), amount_cents, merchant
     except Exception:
-        return None, None, amount_cents
+        return None, None, amount_cents, None
     finally:
         tmp.unlink(missing_ok=True)
 
 
+# Events that carry a pending numbered category pick-list Penny offered the
+# employee. A later `category_chosen`/`category_set` resolves it.
+_PENDING_EVENT = "category_options"
+_RESOLVED_EVENTS = {"category_chosen", "category_set"}
+
+
+def _pending_category_options(conn, cfg, external_id: str):
+    """The still-open numbered category shortlist for this reimbursement, or None.
+    Reads the append-only journal: an unresolved `category_options` is the newest
+    such event with no resolving event after it."""
+    import json
+    pending = None
+    for ev in ledger.reimbursement_events(conn, cfg.client, external_id):
+        if ev["event"] == _PENDING_EVENT:
+            try:
+                opts = (json.loads(ev.get("detail_json") or "{}") or {}).get("options") or []
+            except (ValueError, TypeError):
+                opts = []
+            pending = opts or None
+        elif ev["event"] in _RESOLVED_EVENTS:
+            pending = None
+    return pending
+
+
+def _propose_category(conn, cfg, merchant, parsed):
+    """Best category for a reimbursement. A known merchant on the receipt hits the
+    same deterministic flywheel the card side uses (learned reviewer corrections,
+    then seed rules) for a high-confidence pick; otherwise fall back to the LLM's
+    ranked guess from the parse. Returns (coa_line, confidence, options)."""
+    if merchant:
+        from .categorize import rules as rules_mod
+        pseudo = {"merchant_norm": normalize_merchant(merchant),
+                  "merchant_raw": merchant, "cardholder": None}
+        coa = ledger.learned_rules(conn, cfg.client).get(pseudo["merchant_norm"])
+        prop = None
+        if coa:
+            return coa, "high", [coa]
+        prop = rules_mod.propose(cfg.rules, pseudo)
+        if prop is not None and prop.coa_line in set(cfg.coa_lines):
+            return prop.coa_line, prop.confidence, [prop.coa_line]
+    return (parsed.get("proposed_coa_line"),
+            parsed.get("category_confidence") or ("medium" if parsed.get("proposed_coa_line") else "low"),
+            parsed.get("category_options") or ([parsed["proposed_coa_line"]]
+                                               if parsed.get("proposed_coa_line") else []))
+
+
 def _missing_fields(rc, amount_cents, purpose, coa, receipt_status) -> list:
-    """What's still needed for a complete, accountable-plan reimbursement."""
+    """What the SUBMITTER must still provide for a complete reimbursement. Category
+    is deliberately NOT here — Penny proposes it (the employee never has to recall a
+    category name), and a low-confidence guess is flagged for the reviewer, not
+    bounced back to the submitter. A receipt is only required at/above the threshold
+    (default $100). When the amount isn't known yet we don't ask for a receipt (we
+    may not need it once the amount comes in)."""
     missing = []
     if not amount_cents:
         missing.append("amount")
     if not purpose:
         missing.append("business_purpose")
-    if rc.get("category_required", True) and not coa:
-        missing.append("category")
-    if rc.get("receipt_required", True) and receipt_status != "stored":
+    threshold = rc.get("receipt_threshold_cents", 10000)
+    if (rc.get("receipt_required", True) and amount_cents and amount_cents >= threshold
+            and receipt_status != "stored"):
         missing.append("receipt")
     return missing
 
@@ -100,19 +155,23 @@ def process_intake(conn, cfg, employee, uid, text, month,
     stores the receipt, notifies the approver, and returns
     {reimbursement, status, confirm_back}."""
     rc = cfg.section("reimbursements")
-    parsed = reimburse_parse.interpret_reimbursement(
-        cfg.client, text, cfg.coa_lines, _today())
-
-    amount_cents = parsed.get("amount_cents")
-    purpose = parsed.get("business_purpose")
-    # No silent default: reimbursements aren't payroll-tagged, so the employee must
-    # tell us the COA category (Skyfin books them like card expenses). Missing -> ask.
-    coa = parsed.get("proposed_coa_line")
-    expense_date = parsed.get("expense_date") or _today()
     first = employee.split()[0]
 
-    receipt_status, receipt_link, amount_cents = _store_receipt(
-        cfg, month, employee, purpose, amount_cents, expense_date, slack, file_ids)
+    # Store the receipt FIRST so its merchant can sharpen the category proposal
+    # (parse below runs with that merchant). Amount from the receipt is a fallback.
+    receipt_status, receipt_link, receipt_amount, merchant = _store_receipt(
+        cfg, month, employee, None, None, _today(), slack, file_ids)
+
+    parsed = reimburse_parse.interpret_reimbursement(
+        cfg.client, text, cfg.coa_lines, _today(), merchant=merchant)
+
+    amount_cents = parsed.get("amount_cents") or receipt_amount
+    purpose = parsed.get("business_purpose")
+    expense_date = parsed.get("expense_date") or _today()
+    # Penny PROPOSES the category (the employee never has to name one). A known
+    # merchant hits the deterministic flywheel; else the LLM's ranked guess stands.
+    coa, cat_conf, cat_options = _propose_category(conn, cfg, merchant, parsed)
+    offer_shortlist = cat_conf in ("low", "medium") and len(cat_options) >= 2
 
     missing = _missing_fields(rc, amount_cents, purpose, coa, receipt_status)
     ext = f"reimb-{source_dm_ts}" if source_dm_ts else f"reimb-{uuid.uuid4().hex[:16]}"
@@ -123,6 +182,7 @@ def process_intake(conn, cfg, employee, uid, text, month,
         "submitter_uid": uid, "kind": "one_off", "expense_date": expense_date,
         "close_month": month, "amount_cents": amount_cents or 0, "currency": "USD",
         "business_purpose": purpose, "proposed_coa_line": coa,
+        "rationale": f"auto-proposed ({cat_conf} confidence)" if coa else None,
         "receipt_status": receipt_status, "receipt_link": receipt_link,
         "status": status, "source_dm_ts": source_dm_ts,
     }
@@ -130,8 +190,14 @@ def process_intake(conn, cfg, employee, uid, text, month,
     row = ledger.reimbursement_by_id(conn, rid)
     ledger.record_reimbursement_event(
         conn, cfg.client, ext, status,
-        {"missing": missing, "amount_cents": amount_cents},
+        {"missing": missing, "amount_cents": amount_cents,
+         "proposed_coa_line": coa, "category_confidence": cat_conf},
         actor=employee, source="slack" if slack else "cli")
+    # Remember the shortlist so a bare-number reply ("2") in this thread resolves it.
+    if offer_shortlist:
+        ledger.record_reimbursement_event(conn, cfg.client, ext, _PENDING_EVENT,
+                                          {"options": cat_options}, actor="system",
+                                          source="penny")
 
     violations = reimburse_policy.check(cfg, amount_cents, purpose, coa,
                                         expense_date, _today())
@@ -141,11 +207,17 @@ def process_intake(conn, cfg, employee, uid, text, month,
                                           actor="system", source="policy")
 
     if missing:
+        # The row now exists and Penny's ask is threaded under it, so guide the
+        # employee to REPLY IN THIS THREAD — never to start a new "reimburse"
+        # message (that used to spawn duplicate rows, e.g. Melissa's exchange).
         cb = reimburse_dm.needs_info(first, row, missing,
-                                     trigger=rc.get("trigger", "reimburse"))
+                                     trigger=rc.get("trigger", "reimburse"),
+                                     followup=True)
     else:
         cb = reimburse_dm.ack_intake(first, row)
-        _notify_approver(cfg, row, slack)
+        if offer_shortlist:
+            cb += reimburse_dm.category_options_block(cat_options)
+        _notify_approver(cfg, row, slack, low_confidence=(cat_conf == "low"))
     cb += reimburse_dm.policy_warning(violations)
 
     return {"reimbursement": row, "status": status, "confirm_back": cb}
@@ -171,24 +243,69 @@ def process_followup(conn, cfg, employee, uid, text, month,
                 "confirm_back": reimburse_dm.already(first, row)}
 
     rc = cfg.section("reimbursements")
-    parsed = reimburse_parse.interpret_reimbursement(
-        cfg.client, text, cfg.coa_lines, row.get("expense_date") or _today())
 
-    # Merge: new value wins if present, else keep what we already had (never null out).
-    amount_cents = parsed.get("amount_cents") or (row.get("amount_cents") or None)
-    purpose = parsed.get("business_purpose") or row.get("business_purpose")
-    coa = parsed.get("proposed_coa_line") or row.get("proposed_coa_line")
-    expense_date = row.get("expense_date") or _today()
+    # A bare-number reply ("2", "#2") picks from the numbered category shortlist
+    # Penny last offered — no re-typing the category name. Only when a pick-list is
+    # actually pending and no receipt is attached (a receipt is new info, not a pick).
+    choice = disambiguate.parse_choice(text)
+    pending = _pending_category_options(conn, cfg, ext) if choice else None
+    if choice and pending and not file_ids:
+        if 1 <= choice <= len(pending):
+            picked = pending[choice - 1]
+            ledger.update_reimbursement_fields(conn, row["id"], proposed_coa_line=picked)
+            ledger.record_reimbursement_event(
+                conn, cfg.client, ext, "category_chosen",
+                {"category": picked, "choice": choice}, actor=employee, source="slack")
+            fresh = ledger.reimbursement_by_id(conn, row["id"])
+            miss = _missing_fields(rc, fresh.get("amount_cents"),
+                                   fresh.get("business_purpose"), picked,
+                                   fresh.get("receipt_status"))
+            st = "needs_info" if miss else "submitted"
+            ledger.set_reimbursement_status(conn, row["id"], st)
+            fresh = ledger.reimbursement_by_id(conn, row["id"])
+            if miss:
+                cb = reimburse_dm.needs_info(first, fresh, miss,
+                                             trigger=rc.get("trigger", "reimburse"),
+                                             followup=True)
+            else:
+                cb = reimburse_dm.ack_intake(first, fresh)
+                _notify_approver(cfg, fresh, slack)
+            return {"reimbursement": fresh, "status": st, "confirm_back": cb}
+        cb = reimburse_dm.bad_choice(first, len(pending))
+        return {"reimbursement": row, "status": row["status"], "confirm_back": cb}
 
-    # A receipt sent in the follow-up gets stored now (so it's never lost); if we
-    # already had one, keep it.
+    # A receipt sent in the follow-up gets stored now (so it's never lost) and its
+    # merchant sharpens the category; if we already had one, keep it.
     receipt_status = row.get("receipt_status")
     receipt_link = row.get("receipt_link")
+    merchant = None
+    receipt_amount = None
     if slack and file_ids:
-        rs, rl, amount_cents = _store_receipt(
-            cfg, month, employee, purpose, amount_cents, expense_date, slack, file_ids)
+        rs, rl, receipt_amount, merchant = _store_receipt(
+            cfg, month, employee, row.get("business_purpose"),
+            None, row.get("expense_date") or _today(), slack, file_ids)
         if rs == "stored":
             receipt_status, receipt_link = rs, rl
+
+    parsed = reimburse_parse.interpret_reimbursement(
+        cfg.client, text, cfg.coa_lines, row.get("expense_date") or _today(),
+        merchant=merchant)
+
+    # Merge: new value wins if present, else keep what we already had (never null out).
+    amount_cents = parsed.get("amount_cents") or receipt_amount or (row.get("amount_cents") or None)
+    purpose = parsed.get("business_purpose") or row.get("business_purpose")
+    expense_date = row.get("expense_date") or _today()
+
+    # Category: a follow-up only changes it when it adds real signal — the row had
+    # none yet, or the reply clearly names/confirms one (high confidence). This stops
+    # a bare receipt upload from re-guessing over a category already settled.
+    new_coa, new_conf, new_options = _propose_category(conn, cfg, merchant, parsed)
+    existing = row.get("proposed_coa_line")
+    if existing and new_conf != "high":
+        coa, cat_conf, cat_options = existing, "high", []
+    else:
+        coa, cat_conf, cat_options = (new_coa or existing), new_conf, new_options
+    offer_shortlist = (not existing) and cat_conf in ("low", "medium") and len(cat_options) >= 2
 
     ledger.update_reimbursement_fields(
         conn, row["id"], amount_cents=amount_cents, business_purpose=purpose,
@@ -200,8 +317,14 @@ def process_followup(conn, cfg, employee, uid, text, month,
     status = "needs_info" if missing else "submitted"
     ledger.set_reimbursement_status(conn, row["id"], status)
     ledger.record_reimbursement_event(conn, cfg.client, ext, status,
-                                      {"missing": missing, "followup": True},
+                                      {"missing": missing, "followup": True,
+                                       "proposed_coa_line": coa,
+                                       "category_confidence": cat_conf},
                                       actor=employee, source="slack")
+    if offer_shortlist:
+        ledger.record_reimbursement_event(conn, cfg.client, ext, _PENDING_EVENT,
+                                          {"options": cat_options}, actor="system",
+                                          source="penny")
     violations = reimburse_policy.check(cfg, amount_cents, purpose, coa,
                                         expense_date, _today())
     if violations:
@@ -215,13 +338,17 @@ def process_followup(conn, cfg, employee, uid, text, month,
                                      followup=True)
     else:
         cb = reimburse_dm.ack_intake(first, fresh)
-        _notify_approver(cfg, fresh, slack)
+        if offer_shortlist:
+            cb += reimburse_dm.category_options_block(cat_options)
+        _notify_approver(cfg, fresh, slack, low_confidence=(cat_conf == "low"))
     cb += reimburse_dm.policy_warning(violations)
     return {"reimbursement": fresh, "status": status, "confirm_back": cb}
 
 
-def _notify_approver(cfg, row: dict, slack):
-    """DM the approver that a reimbursement is waiting (best-effort)."""
+def _notify_approver(cfg, row: dict, slack, low_confidence: bool = False):
+    """DM the approver that a reimbursement is waiting (best-effort). When Penny's
+    category is a low-confidence guess, flag that so the reviewer double-checks it —
+    the uncertainty goes to the approver, never back to the submitter."""
     if not slack:
         return
     approver = approver_for(cfg, row["employee"])
@@ -229,7 +356,8 @@ def _notify_approver(cfg, row: dict, slack):
     if not uid:
         return
     try:
-        slack.send_dm(uid, reimburse_dm.approval_request(row, _dashboard_url()))
+        slack.send_dm(uid, reimburse_dm.approval_request(
+            row, _dashboard_url(), low_confidence=low_confidence))
     except Exception:
         pass
 

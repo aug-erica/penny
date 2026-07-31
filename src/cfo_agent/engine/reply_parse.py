@@ -77,7 +77,15 @@ def interpret_reply(client: str, reply: str, charges: List[dict],
         if proj in (None, "null", ""):
             proj = None
         elif proj not in valid_projects:
-            continue  # never invent a project
+            # Not an exact active-project name — accept a confident near-match
+            # ("McCain WOMB" -> "McCain WOMB PACE") rather than silently dropping it,
+            # so pals don't have to recall the exact contract string. Genuinely
+            # ambiguous shorthand (several projects equally close) stays dropped.
+            from . import disambiguate
+            match = disambiguate.fuzzy_one(proj, projects)
+            if not match:
+                continue  # never invent a project
+            proj = match
         out.append({
             "external_id": charges[i]["external_id"],
             "merchant": charges[i]["merchant_raw"],

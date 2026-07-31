@@ -17,10 +17,41 @@ def _one_line(r: dict) -> str:
 
 def ack_intake(first: str, r: dict, bot_name: str = "Penny") -> str:
     rc = ", receipt ✓" if r.get("receipt_status") == "stored" else ""
+    cat = r.get("proposed_coa_line")
+    # Penny proposed the category — say so and invite a one-word correction, so the
+    # employee never has to recall or type a category name up front.
+    cat_note = (f" I filed it under *{cat}* — just reply if that's off. " if cat
+                else " ")
     return (
-        f"Got it, {first} — logged a reimbursement for {_one_line(r)}{rc}. "
+        f"Got it, {first} — logged a reimbursement for {_one_line(r)}{rc}.{cat_note}"
         f"It's in the approval queue now; I'll let you know once it's approved "
         f"and set for payout. 🧾")
+
+
+def category_options_block(options: list) -> str:
+    """A short numbered pick-list appended when Penny isn't sure of the category.
+    The employee replies with a number instead of retyping the name."""
+    if not options:
+        return ""
+    lines = ["\n_Not 100% sure on the category — if it's off, reply with the number:_"]
+    for i, o in enumerate(options, 1):
+        lines.append(f"   {i}) {o}")
+    return "\n".join(lines)
+
+
+def bad_choice(first: str, n: int) -> str:
+    rng = "1" if n == 1 else f"1–{n}"
+    return f"Sorry {first} — I only listed {n} option{'s' if n != 1 else ''}. Reply with {rng}."
+
+
+def clarify_intent(first: str) -> str:
+    """Asked only when Penny can't tell if a pal-initiated DM is a new out-of-pocket
+    reimbursement or an answer about a card charge. The pal just replies with a word;
+    Penny resolves it against what they already sent (no resending / re-uploading)."""
+    return (f"Quick check, {first} — did you pay for this out of pocket (a "
+            f"*reimbursement*), or is it about a *company-card charge* I flagged? "
+            f"Just reply *reimbursement* or *card* and I'll take it from there — no "
+            f"need to resend anything.")
 
 
 def needs_info(first: str, r: dict, missing: list, trigger: str = "reimburse",
@@ -74,12 +105,14 @@ def already(first: str, r: dict, bot_name: str = "Penny") -> str:
 
 
 def approval_request(r: dict, dashboard_url: str = None,
-                     bot_name: str = "Penny") -> str:
+                     bot_name: str = "Penny", low_confidence: bool = False) -> str:
     emp = r.get("employee", "someone")
     line = f"*{emp}* — {_one_line(r)}"
+    flag = ("\n   ⚠️ *category is my best guess — worth a double-check*"
+            if low_confidence else "")
     tail = (f"\nApprove or reject in the queue: {dashboard_url}/reimbursements"
             if dashboard_url else "\nApprove or reject it in the reimbursements queue.")
-    return f"🧾 New reimbursement to review:\n   • {line}{tail}"
+    return f"🧾 New reimbursement to review:\n   • {line}{flag}{tail}"
 
 
 def approved(first: str, r: dict, bot_name: str = "Penny") -> str:

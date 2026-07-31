@@ -6,6 +6,7 @@ receipt, and replies with a confirm-back — all autonomously.
 from __future__ import annotations
 
 import calendar
+import json
 import re
 import sys
 import threading
@@ -23,8 +24,37 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from ..config import RUNS_LOCAL, env, load_client
 from ..engine import continuous_close as cc_mod
 from ..engine import digest as digest_mod
-from ..engine import kv, ledger, penny_catchup, reimburse_flow, reply_flow
+from ..engine import (intent, kv, ledger, penny_catchup, receipts, reimburse_dm,
+                      reimburse_flow, reply_flow)
 from .slack_client import PennySlack
+
+
+def _load_pending(key: str, now_ts: str):
+    """The pal's stashed pre-clarifier message (text + file ids), or None if there
+    isn't one or it's stale (>1h). `now_ts`/stored ts are Slack epoch-second ts."""
+    raw = kv.get(key)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not d or not d.get("ts"):
+        return None
+    try:
+        if float(now_ts) - float(d["ts"]) > 3600:
+            return None
+    except (TypeError, ValueError):
+        pass
+    return d
+
+
+def _awaiting_receipts(conn, cfg, employee: str, month: str) -> bool:
+    """True if this pal has card charges still missing a receipt — so a bare
+    receipt they send is probably answering that, not a brand-new expense."""
+    charges = reply_flow._pal_charges(conn, cfg.client, month, employee)
+    return bool([c for c in receipts.receipt_needed(charges)
+                 if c.get("receipt_status") != "stored"])
 
 # Daily digest posts around this hour UTC (~9am ET). The scheduler checks a few
 # times an hour and posts once/day during the first week (guarded in the DB).
@@ -174,59 +204,141 @@ def run(client_name: str, month: str):
                     ledger.mark_dm_processed(conn, e.get("ts"), slack_users.get(uid))
                 return
 
-        # Reimbursements. A DM starting with the trigger word ("reimburse") is a NEW
-        # out-of-pocket expense. A reply IN an existing reimbursement's thread needs
-        # no trigger word — Penny remembers that charge and fills in what's new (so
-        # nobody re-sends or re-uploads a receipt). The card flow stays untouched:
-        # only trigger-word DMs and replies under a reimbursement thread are caught.
+        # Reimbursement vs card routing. Penny initiates ALL card-charge
+        # conversations (the continuous-close poller DMs pals about QBO-feed
+        # charges), so a pal who STARTS a conversation is almost always filing an
+        # out-of-pocket reimbursement. So the "reimburse" trigger word is no longer
+        # required: a pal-initiated top-level DM defaults to a reimbursement (an
+        # explicit trigger still forces one), thread replies route by their thread,
+        # and a genuinely ambiguous message gets a one-line clarifier whose answer
+        # we resolve against the stashed original (no resending / re-uploading).
         rc = cfg.section("reimbursements")
+        enabled = bool(rc.get("enabled"))
         trigger = (rc.get("trigger") or "reimburse").lower()
-        starts_trigger = bool(rc.get("enabled")) and text.strip().lower().startswith(trigger)
+        starts_trigger = enabled and text.strip().lower().startswith(trigger)
         employee = slack_users.get(uid)
-        participants = set(rc.get("participants", []))
+        # Open to everyone (open_to_all) = any mapped teammate can submit; else the
+        # explicit participants allow-list.
+        participants = (set(slack_users.values()) if rc.get("open_to_all")
+                        else set(rc.get("participants", [])))
+        can_reimburse = enabled and bool(employee) and employee in participants
         thread_ts = e.get("thread_ts")
+        msg_ts = e.get("ts")
+        file_ids = [f["id"] for f in e.get("files", []) if f.get("id")]
+        pending_key = f"pending_intent:{cfg.client}:{uid}"
 
-        # A non-participant tried the trigger word -> pilot notice (don't card-route it).
-        if starts_trigger and (not employee or employee not in participants):
+        # Someone we can't map/authorize tried the trigger word — we need an
+        # employee identity (for the vendor/booking), so ask them to get added.
+        if starts_trigger and not can_reimburse:
             conn = ledger.open_db(db_path)
-            penny.send_dm(uid, "Reimbursements through Penny are in a limited pilot "
-                          "right now — please keep using Expensify for now. (Ping Erica "
-                          "to join the pilot.)", thread_ts=e.get("ts"))
-            ledger.mark_dm_processed(conn, e.get("ts"), employee)
+            msg = ("I don't have you mapped to an employee yet, so I can't file a "
+                   "reimbursement for you — ping Erica to get set up." if not employee
+                   else "Reimbursements through Penny aren't open to you yet — ping "
+                   "Erica to join.")
+            penny.send_dm(uid, msg, thread_ts=msg_ts)
+            ledger.mark_dm_processed(conn, msg_ts, employee)
             return
 
-        if rc.get("enabled") and employee in participants and (starts_trigger or thread_ts):
+        if can_reimburse:
             conn = ledger.open_db(db_path)
-            followup_ext = f"reimb-{thread_ts}" if thread_ts else None
-            is_followup = bool(not starts_trigger and followup_ext
-                               and ledger.reimbursement_by_external_id(
-                                   conn, cfg.client, followup_ext))
-            if starts_trigger or is_followup:
-                if not ledger.claim_dm(conn, e.get("ts"), employee):
+
+            def _intake(itext, anchor_ts, ifiles):
+                """File a reimbursement from `itext`+`ifiles`; anchor its thread/id
+                to `anchor_ts` (the pal's original message, even when resolved later
+                via a clarifier). Dedup on the CURRENT message (msg_ts)."""
+                if not ledger.claim_dm(conn, msg_ts, employee):
                     _log(f"[skip] {employee}: reimbursement msg already claimed (dup)")
                     return
-                file_ids = [f["id"] for f in e.get("files", []) if f.get("id")]
                 try:
-                    if starts_trigger:
-                        _log(f"[reimburse] {employee} intake: {text[:60]!r} "
-                             f"+ {len(file_ids)} file(s)")
-                        res = reimburse_flow.process_intake(
-                            conn, cfg, employee, uid, text, active_month(),
-                            slack=penny, file_ids=file_ids, source_dm_ts=e.get("ts"))
-                        penny.send_dm(uid, res["confirm_back"], thread_ts=e.get("ts"))
-                    else:
-                        _log(f"[reimburse] {employee} follow-up in {followup_ext}: "
-                             f"{text[:50]!r} + {len(file_ids)} file(s)")
-                        res = reimburse_flow.process_followup(
-                            conn, cfg, employee, uid, text, active_month(),
-                            slack=penny, file_ids=file_ids, thread_ts=thread_ts)
-                        penny.send_dm(uid, res["confirm_back"], thread_ts=thread_ts)
+                    _log(f"[reimburse] {employee} intake: {itext[:60]!r} "
+                         f"+ {len(ifiles)} file(s)")
+                    res = reimburse_flow.process_intake(
+                        conn, cfg, employee, uid, itext, active_month(),
+                        slack=penny, file_ids=ifiles, source_dm_ts=anchor_ts)
+                    penny.send_dm(uid, res["confirm_back"], thread_ts=anchor_ts)
                     _log(f"[reimburse] {employee}: {res['status']}")
                 except Exception:
-                    ledger.unclaim_dm(conn, e.get("ts"))
+                    ledger.unclaim_dm(conn, msg_ts)
+                    _log(f"[error] reimbursement {employee}: {traceback.format_exc()}")
+
+            def _card(ctext, cfiles):
+                """Route a message to the card-charge reply flow (used when a
+                clarifier answer says 'card')."""
+                if not ledger.claim_dm(conn, msg_ts, employee):
+                    _log(f"[skip] {employee}: msg already claimed (dup)")
+                    return
+                try:
+                    res = reply_flow.process_pal_reply(
+                        conn, cfg, employee, ctext, active_month(),
+                        slack=penny, file_ids=cfiles)
+                    penny.send_dm(uid, res["confirm_back"], thread_ts=msg_ts)
+                    _log(f"[done] {employee}: card reply (via clarifier)")
+                except Exception:
+                    ledger.unclaim_dm(conn, msg_ts)
+                    _log(f"[error] card {employee}: {traceback.format_exc()}")
+
+            # 1) Reply inside an existing reimbursement's thread -> follow-up (thread
+            #    wins, even if the person re-typed "reimburse" — never duplicates).
+            followup_ext = f"reimb-{thread_ts}" if thread_ts else None
+            if followup_ext and ledger.reimbursement_by_external_id(
+                    conn, cfg.client, followup_ext):
+                if not ledger.claim_dm(conn, msg_ts, employee):
+                    _log(f"[skip] {employee}: reimbursement msg already claimed (dup)")
+                    return
+                try:
+                    _log(f"[reimburse] {employee} follow-up in {followup_ext}: "
+                         f"{text[:50]!r} + {len(file_ids)} file(s)")
+                    res = reimburse_flow.process_followup(
+                        conn, cfg, employee, uid, text, active_month(),
+                        slack=penny, file_ids=file_ids, thread_ts=thread_ts)
+                    penny.send_dm(uid, res["confirm_back"], thread_ts=thread_ts)
+                    _log(f"[reimburse] {employee}: {res['status']}")
+                except Exception:
+                    ledger.unclaim_dm(conn, msg_ts)
                     _log(f"[error] reimbursement {employee}: {traceback.format_exc()}")
                 return
-            # participant replied in a NON-reimbursement thread -> card path below
+
+            # 2) Explicit trigger word (top-level) -> intake (backward compatible).
+            if starts_trigger and not thread_ts:
+                _intake(text, msg_ts, file_ids)
+                return
+
+            # 3) A clarifier is pending -> read the answer and resolve the STASHED
+            #    original message, so the pal never re-types or re-uploads.
+            if not thread_ts:
+                pend = _load_pending(pending_key, msg_ts)
+                if pend is not None:
+                    kv.set(pending_key, "")   # one-shot; always clear
+                    ans = intent.interpret_answer(text)
+                    if ans == "reimbursement":
+                        _intake(pend["text"], pend["ts"], pend.get("file_ids") or [])
+                        return
+                    if ans == "card":
+                        _card(pend["text"], pend.get("file_ids") or [])
+                        return
+                    # Couldn't read the answer -> treat THIS message fresh (below).
+
+            # 4) Wordless, pal-initiated top-level DM -> classify intent.
+            if not thread_ts:
+                month = active_month()
+                projects = reply_flow._projects(cfg, month)
+                awaiting = _awaiting_receipts(conn, cfg, employee, month)
+                kind = intent.classify(cfg.client, text, bool(file_ids),
+                                       awaiting, projects)
+                if kind == "reimbursement":
+                    _intake(text, msg_ts, file_ids)
+                    return
+                if kind == "ambiguous":
+                    if not ledger.claim_dm(conn, msg_ts, employee):
+                        _log(f"[skip] {employee}: msg already claimed (dup)")
+                        return
+                    kv.set(pending_key, json.dumps(
+                        {"ts": msg_ts, "text": text, "file_ids": file_ids}))
+                    penny.send_dm(uid, reimburse_dm.clarify_intent(employee.split()[0]),
+                                  thread_ts=msg_ts)
+                    _log(f"[intent] {employee}: ambiguous -> asked clarifier")
+                    return
+                # kind == "card" -> fall through to the card path below.
 
         cardholder = resolve_cardholder(uid, text)
         if not cardholder:

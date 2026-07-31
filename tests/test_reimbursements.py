@@ -77,19 +77,98 @@ def test_cant_approve_own(tmp_path):
     assert fresh["status"] == "approved"
 
 
-def test_needs_info_when_receipt_missing(tmp_path, monkeypatch):
+def test_needs_info_when_missing(tmp_path, monkeypatch):
     conn = ledger.open_db(tmp_path / "l.sqlite3")
     cfg = load_client(CLIENT)
-    # No API key -> parser returns {} -> amount/purpose/receipt all missing.
+    # No API key -> parser returns {} -> amount/purpose missing. Category is NEVER
+    # asked of the submitter now (Penny proposes it). Receipt is not asked here
+    # because the amount is unknown (and <$100 wouldn't need one).
     res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
                                         "reimburse something", "2026-07",
                                         slack=None, file_ids=None,
                                         source_dm_ts="1720000000.0001")
     assert res["status"] == "needs_info"
     cb = res["confirm_back"].lower()
-    assert "receipt" in cb and "category" in cb   # both are required, both asked for
+    assert "amount" in cb and "business purpose" in cb
+    assert "category" not in cb                     # Penny proposes it; never asks the submitter
+    assert "reply here in this thread" in cb        # not "start a new reimburse message"
     row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-1720000000.0001")
     assert row and row["status"] == "needs_info"
+
+
+def test_category_is_auto_proposed_not_required(tmp_path, monkeypatch):
+    """The core fix: an intake that never names a category still reaches 'submitted'
+    with Penny's proposed category — the submitter is never blocked on it."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 4200, "business_purpose": "team lunch",
+        "expense_date": "2026-07-14", "proposed_coa_line": "Groceries & Meals",
+        "category_confidence": "high", "category_options": ["Groceries & Meals"]})
+    res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                        "reimburse $42 team lunch", "2026-07",
+                                        source_dm_ts="1720000000.1000")
+    assert res["status"] == "submitted"
+    assert res["reimbursement"]["proposed_coa_line"] == "Groceries & Meals"
+    assert "groceries & meals" in res["confirm_back"].lower()
+
+
+def test_low_confidence_offers_numbered_shortlist_and_pick_resolves(tmp_path, monkeypatch):
+    """Ambiguous category -> Penny files its best guess but offers a numbered
+    shortlist; a bare-number reply in the thread resolves it (no re-typing)."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 4200, "business_purpose": "coffee with a candidate",
+        "expense_date": "2026-07-14", "proposed_coa_line": "Groceries & Meals",
+        "category_confidence": "low",
+        "category_options": ["Groceries & Meals", "Sales - Client Engagement & Lead Development"]})
+    res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                        "reimburse $42 coffee", "2026-07",
+                                        source_dm_ts="1720000000.2000")
+    assert res["status"] == "submitted"
+    cb = res["confirm_back"].lower()
+    assert "reply with the number" in cb and "1)" in cb and "2)" in cb
+    # Now the employee replies "2" in the thread -> picks the 2nd option. (The pick
+    # is resolved before any parse, so no LLM is involved.)
+    reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                    "2", "2026-07", thread_ts="1720000000.2000")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-1720000000.2000")
+    assert row["proposed_coa_line"] == "Sales - Client Engagement & Lead Development"
+    assert any(e["event"] == "category_chosen"
+               for e in ledger.reimbursement_events(conn, CLIENT, "reimb-1720000000.2000"))
+
+
+def test_propose_category_uses_merchant_cascade(tmp_path):
+    """A known merchant on the receipt is categorized by the same deterministic
+    flywheel the card side uses — seed rules, then learned reviewer corrections
+    (high confidence) which win over seed rules. No LLM involved."""
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    # Seed rule hit (rules.yaml): a software merchant maps to a subscription line.
+    coa, conf, _opts = reimburse_flow._propose_category(conn, cfg, "FIGMA", {})
+    assert coa == "Web Services & Subscriptions"
+    # Flywheel: a prior reviewer correction beats the seed rule, at high confidence.
+    ledger.upsert_learned_rule(conn, CLIENT, "FIGMA", "Office Supplies (NY & Home)", "reviewer")
+    coa, conf, _opts = reimburse_flow._propose_category(conn, cfg, "Figma", {})
+    assert coa == "Office Supplies (NY & Home)" and conf == "high"
+    # Unknown merchant with no parse -> nothing deterministic (LLM handles it in prod).
+    assert reimburse_flow._propose_category(conn, cfg, "brand new cafe xyz", {})[0] is None
+
+
+def test_receipt_required_only_at_threshold():
+    from cfo_agent.engine.reimburse_flow import _missing_fields
+    rc = load_client(CLIENT).section("reimbursements")   # threshold 10000 ($100)
+    # under $100 with a category + purpose -> complete, NO receipt asked
+    assert _missing_fields(rc, 5000, "monthly internet", "Telephone & Internet", None) == []
+    # $100+ with no receipt -> receipt required
+    assert "receipt" in _missing_fields(rc, 15000, "flight", "General Travel", None)
+    # amount unknown -> receipt not asked yet (only amount/purpose as relevant)
+    assert "receipt" not in _missing_fields(rc, None, None, None, None)
+    # category is NEVER a submitter-blocking field now (Penny proposes it)
+    assert "category" not in _missing_fields(rc, 5000, "lunch", None, None)
 
 
 def test_idempotent_stipends(tmp_path):

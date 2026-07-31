@@ -134,20 +134,34 @@ billable:
   # adapters/projects/hubspot_projects.py. Headless refresh needs HUBSPOT_TOKEN.
   billable_projects_file: "active_projects.yaml"
 
-# Employee out-of-pocket REIMBURSEMENTS (moving off Expensify). An employee DMs
-# Penny a message starting with the trigger word ("reimburse $42 client lunch")
-# + a receipt; Penny logs it, Purvi approves it in the dashboard queue, and Penny
-# produces a copy-paste Justworks payout summary a human enters in Justworks.
+# Employee out-of-pocket REIMBURSEMENTS (moving off Expensify). A pal just DMs
+# Penny about an expense they paid for ("$42 client lunch" + a receipt) — the
+# "reimburse" trigger word is OPTIONAL now: because Penny initiates all card-charge
+# conversations itself, a pal-INITIATED top-level DM defaults to a reimbursement
+# (see engine/intent.py; ambiguous messages get a one-line clarifier). Penny logs
+# it, Purvi approves it in the dashboard queue, and Penny produces a copy-paste
+# Justworks payout summary a human enters in Justworks.
 # v1 = a 3-person pilot, parallel to Expensify. Gated by `participants` (mirrors
 # continuous_close.cardholders).
 reimbursements:
   enabled: true
-  trigger: "reimburse"
-  receipt_required: true                 # accountable-plan: receipt is mandatory
-  category_required: true                # employees must state the COA category (these
-                                         # aren't payroll-tagged — Skyfin books them like
-                                         # card expenses), so we ask for it at intake
-  participants:                          # pilot — the only people Penny accepts intake from
+  trigger: "reimburse"                   # OPTIONAL explicit override now — a pal-initiated
+                                         # top-level DM defaults to a reimbursement without
+                                         # it (intent-routed; see engine/intent.py)
+  receipt_required: true                 # require a receipt only at/above the threshold
+  receipt_threshold_cents: 10000         # receipts required only for $100+ (matches the
+                                         # card side); under $100 no receipt is asked
+  category_required: false               # Penny PROPOSES the category (like it does for
+                                         # card spend) — the employee never has to recall
+                                         # or type a category name. A low-confidence guess
+                                         # is flagged for the reviewer, never bounced back
+                                         # to the submitter. (Reviewer still confirms in the
+                                         # dashboard; Skyfin books off the approved category.)
+  open_to_all: true                      # OPEN TO THE WHOLE TEAM (July 24, 2026) — any
+                                         # mapped teammate (bot.slack_users) can submit.
+                                         # `participants` below is now just the original
+                                         # pilot record, ignored while open_to_all is on.
+  participants:                          # (superseded by open_to_all)
     - "Erica Seldin"
     - "Purvi Patel"
     - "Keara Mascareñas"                 # August's reimbursement beta tester / power user
