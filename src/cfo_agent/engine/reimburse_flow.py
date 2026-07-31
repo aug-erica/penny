@@ -83,28 +83,88 @@ def _store_receipt(cfg, month, employee, purpose, amount_cents, expense_date,
         tmp.unlink(missing_ok=True)
 
 
-# Events that carry a pending numbered category pick-list Penny offered the
-# employee. A later `category_chosen`/`category_set` resolves it.
-_PENDING_EVENT = "category_options"
-_RESOLVED_EVENTS = {"category_chosen", "category_set"}
+# Events that carry a pending numbered pick-list Penny offered the employee, per
+# dimension. A matching *_chosen/*_set resolves it. `category` = which COA line;
+# `project` = which client/contract to bill (for a billable reimbursement).
+_CATEGORY_OPTS = "category_options"
+_PROJECT_OPTS = "project_options"
+_OPT_DIM = {_CATEGORY_OPTS: "category", _PROJECT_OPTS: "project"}
+_RESOLVES = {"category_chosen": "category", "category_set": "category",
+             "project_chosen": "project", "project_set": "project"}
 
 
-def _pending_category_options(conn, cfg, external_id: str):
-    """The still-open numbered category shortlist for this reimbursement, or None.
-    Reads the append-only journal: an unresolved `category_options` is the newest
-    such event with no resolving event after it."""
+def _pending_options(conn, cfg, external_id: str):
+    """The still-open numbered pick-list for this reimbursement as
+    (dimension, options), or (None, None). Reads the append-only journal: an
+    options event with no matching resolve event after it is the open one."""
     import json
-    pending = None
+    dim, opts = None, None
     for ev in ledger.reimbursement_events(conn, cfg.client, external_id):
-        if ev["event"] == _PENDING_EVENT:
+        e = ev["event"]
+        if e in _OPT_DIM:
             try:
-                opts = (json.loads(ev.get("detail_json") or "{}") or {}).get("options") or []
+                o = (json.loads(ev.get("detail_json") or "{}") or {}).get("options") or []
             except (ValueError, TypeError):
-                opts = []
-            pending = opts or None
-        elif ev["event"] in _RESOLVED_EVENTS:
-            pending = None
-    return pending
+                o = []
+            dim, opts = (_OPT_DIM[e], o) if o else (None, None)
+        elif _RESOLVES.get(e) == dim:
+            dim, opts = None, None
+    return dim, opts
+
+
+def _is_billable(cfg, coa) -> bool:
+    """True when this category means 'bill it to a client' (so Penny must capture
+    which project) — mirrors the card side's billable_categories."""
+    return bool(coa) and coa in (cfg.section("billable").get("billable_categories") or [])
+
+
+def _resolve_project(text: str, projects: list):
+    """Read a client/project out of a free-text reply. Returns (project, options):
+    a confident single match -> (name, None); several plausible ones (e.g. one
+    client with multiple projects) -> (None, shortlist) for a numbered pick; nothing
+    close -> (None, None)."""
+    low = (text or "").strip().lower()
+    if not low or not projects:
+        return None, None
+    contains = [p for p in projects if low in p.lower() or p.lower() in low]
+    if len(contains) == 1:
+        return contains[0], None
+    if len(contains) > 1:
+        return None, contains[:5]
+    one = disambiguate.fuzzy_one(text, projects)
+    if one:
+        return one, None
+    return None, (disambiguate.shortlist(text, projects, limit=3) or None)
+
+
+def _ack_or_ask_client(conn, cfg, ext, rid, first, slack, cat_conf="high",
+                       cat_options=None):
+    """Tail shared by intake/follow-up/pick once the submitter-required basics are
+    in. Persists the billable flag; if the category is billable but no client is
+    set yet, asks which client to bill (numbered pick-list when one was offered,
+    else an open ask) instead of acking; otherwise acks + notifies the approver.
+    Returns (status, fresh_row, confirm_back)."""
+    row = ledger.reimbursement_by_id(conn, rid)
+    billable = _is_billable(cfg, row.get("proposed_coa_line"))
+    if bool(row.get("billable")) != billable:
+        ledger.update_reimbursement_fields(conn, rid, billable=1 if billable else 0)
+        row = ledger.reimbursement_by_id(conn, rid)
+    if billable and not row.get("project"):
+        ledger.set_reimbursement_status(conn, rid, "needs_info")
+        ledger.record_reimbursement_event(conn, cfg.client, ext, "project_prompt", {},
+                                          actor="system", source="penny")
+        row = ledger.reimbursement_by_id(conn, rid)
+        dim, opts = _pending_options(conn, cfg, ext)
+        cb = (reimburse_dm.project_options_block(opts)
+              if dim == "project" and opts else reimburse_dm.project_ask(first, row))
+        return "needs_info", row, cb
+    ledger.set_reimbursement_status(conn, rid, "submitted")
+    row = ledger.reimbursement_by_id(conn, rid)
+    cb = reimburse_dm.ack_intake(first, row)
+    if cat_options:
+        cb += reimburse_dm.category_options_block(cat_options)
+    _notify_approver(cfg, row, slack, low_confidence=(cat_conf == "low"))
+    return "submitted", row, cb
 
 
 def _propose_category(conn, cfg, merchant, parsed):
@@ -195,7 +255,7 @@ def process_intake(conn, cfg, employee, uid, text, month,
         actor=employee, source="slack" if slack else "cli")
     # Remember the shortlist so a bare-number reply ("2") in this thread resolves it.
     if offer_shortlist:
-        ledger.record_reimbursement_event(conn, cfg.client, ext, _PENDING_EVENT,
+        ledger.record_reimbursement_event(conn, cfg.client, ext, _CATEGORY_OPTS,
                                           {"options": cat_options}, actor="system",
                                           source="penny")
 
@@ -214,10 +274,10 @@ def process_intake(conn, cfg, employee, uid, text, month,
                                      trigger=rc.get("trigger", "reimburse"),
                                      followup=True)
     else:
-        cb = reimburse_dm.ack_intake(first, row)
-        if offer_shortlist:
-            cb += reimburse_dm.category_options_block(cat_options)
-        _notify_approver(cfg, row, slack, low_confidence=(cat_conf == "low"))
+        # Basics are in — ack, or (if the category is billable) ask which client.
+        status, row, cb = _ack_or_ask_client(
+            conn, cfg, ext, rid, first, slack, cat_conf=cat_conf,
+            cat_options=cat_options if offer_shortlist else None)
     cb += reimburse_dm.policy_warning(violations)
 
     return {"reimbursement": row, "status": status, "confirm_back": cb}
@@ -248,30 +308,36 @@ def process_followup(conn, cfg, employee, uid, text, month,
     # Penny last offered — no re-typing the category name. Only when a pick-list is
     # actually pending and no receipt is attached (a receipt is new info, not a pick).
     choice = disambiguate.parse_choice(text)
-    pending = _pending_category_options(conn, cfg, ext) if choice else None
-    if choice and pending and not file_ids:
-        if 1 <= choice <= len(pending):
-            picked = pending[choice - 1]
-            ledger.update_reimbursement_fields(conn, row["id"], proposed_coa_line=picked)
-            ledger.record_reimbursement_event(
-                conn, cfg.client, ext, "category_chosen",
-                {"category": picked, "choice": choice}, actor=employee, source="slack")
+    dim, opts = _pending_options(conn, cfg, ext) if choice else (None, None)
+    if choice and opts and not file_ids:
+        if 1 <= choice <= len(opts):
+            picked = opts[choice - 1]
+            if dim == "project":
+                ledger.update_reimbursement_fields(conn, row["id"], project=picked)
+                ledger.record_reimbursement_event(
+                    conn, cfg.client, ext, "project_chosen",
+                    {"project": picked, "choice": choice}, actor=employee, source="slack")
+            else:
+                ledger.update_reimbursement_fields(conn, row["id"], proposed_coa_line=picked)
+                ledger.record_reimbursement_event(
+                    conn, cfg.client, ext, "category_chosen",
+                    {"category": picked, "choice": choice}, actor=employee, source="slack")
             fresh = ledger.reimbursement_by_id(conn, row["id"])
             miss = _missing_fields(rc, fresh.get("amount_cents"),
-                                   fresh.get("business_purpose"), picked,
+                                   fresh.get("business_purpose"),
+                                   fresh.get("proposed_coa_line"),
                                    fresh.get("receipt_status"))
-            st = "needs_info" if miss else "submitted"
-            ledger.set_reimbursement_status(conn, row["id"], st)
-            fresh = ledger.reimbursement_by_id(conn, row["id"])
             if miss:
+                ledger.set_reimbursement_status(conn, row["id"], "needs_info")
+                fresh = ledger.reimbursement_by_id(conn, row["id"])
                 cb = reimburse_dm.needs_info(first, fresh, miss,
                                              trigger=rc.get("trigger", "reimburse"),
                                              followup=True)
-            else:
-                cb = reimburse_dm.ack_intake(first, fresh)
-                _notify_approver(cfg, fresh, slack)
+                return {"reimbursement": fresh, "status": "needs_info", "confirm_back": cb}
+            # Basics in — ack, or (if the pick made it billable) ask which client.
+            st, fresh, cb = _ack_or_ask_client(conn, cfg, ext, row["id"], first, slack)
             return {"reimbursement": fresh, "status": st, "confirm_back": cb}
-        cb = reimburse_dm.bad_choice(first, len(pending))
+        cb = reimburse_dm.bad_choice(first, len(opts))
         return {"reimbursement": row, "status": row["status"], "confirm_back": cb}
 
     # A receipt sent in the follow-up gets stored now (so it's never lost) and its
@@ -313,34 +379,50 @@ def process_followup(conn, cfg, employee, uid, text, month,
     if receipt_status == "stored" and row.get("receipt_status") != "stored":
         ledger.set_reimbursement_receipt(conn, row["id"], "stored", receipt_link)
 
-    missing = _missing_fields(rc, amount_cents, purpose, coa, receipt_status)
-    status = "needs_info" if missing else "submitted"
-    ledger.set_reimbursement_status(conn, row["id"], status)
-    ledger.record_reimbursement_event(conn, cfg.client, ext, status,
-                                      {"missing": missing, "followup": True,
-                                       "proposed_coa_line": coa,
-                                       "category_confidence": cat_conf},
-                                      actor=employee, source="slack")
     if offer_shortlist:
-        ledger.record_reimbursement_event(conn, cfg.client, ext, _PENDING_EVENT,
+        ledger.record_reimbursement_event(conn, cfg.client, ext, _CATEGORY_OPTS,
                                           {"options": cat_options}, actor="system",
                                           source="penny")
+
+    # Billable + no client yet -> read a client from this reply (a name resolves it;
+    # an ambiguous client — e.g. several projects for one account — offers a pick).
+    if _is_billable(cfg, coa) and not row.get("project"):
+        from . import reply_flow
+        projects = reply_flow._projects(cfg, month)
+        proj, proj_opts = _resolve_project(text, projects)
+        if proj:
+            ledger.update_reimbursement_fields(conn, row["id"], project=proj)
+            ledger.record_reimbursement_event(conn, cfg.client, ext, "project_set",
+                                              {"project": proj}, actor=employee,
+                                              source="slack")
+        elif proj_opts:
+            ledger.record_reimbursement_event(conn, cfg.client, ext, _PROJECT_OPTS,
+                                              {"options": proj_opts}, actor="system",
+                                              source="penny")
+
     violations = reimburse_policy.check(cfg, amount_cents, purpose, coa,
                                         expense_date, _today())
     if violations:
         ledger.record_reimbursement_event(conn, cfg.client, ext, "policy_flag",
                                           {"violations": violations, "followup": True},
                                           actor="system", source="policy")
-    fresh = ledger.reimbursement_by_id(conn, row["id"])
+
+    missing = _missing_fields(rc, amount_cents, purpose, coa, receipt_status)
     if missing:
+        ledger.set_reimbursement_status(conn, row["id"], "needs_info")
+        fresh = ledger.reimbursement_by_id(conn, row["id"])
         cb = reimburse_dm.needs_info(first, fresh, missing,
                                      trigger=rc.get("trigger", "reimburse"),
                                      followup=True)
+        status = "needs_info"
     else:
-        cb = reimburse_dm.ack_intake(first, fresh)
-        if offer_shortlist:
-            cb += reimburse_dm.category_options_block(cat_options)
-        _notify_approver(cfg, fresh, slack, low_confidence=(cat_conf == "low"))
+        status, fresh, cb = _ack_or_ask_client(
+            conn, cfg, ext, row["id"], first, slack, cat_conf=cat_conf,
+            cat_options=cat_options if offer_shortlist else None)
+    ledger.record_reimbursement_event(conn, cfg.client, ext, status,
+                                      {"followup": True, "proposed_coa_line": coa,
+                                       "category_confidence": cat_conf},
+                                      actor=employee, source="slack")
     cb += reimburse_dm.policy_warning(violations)
     return {"reimbursement": fresh, "status": status, "confirm_back": cb}
 

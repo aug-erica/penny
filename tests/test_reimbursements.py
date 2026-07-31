@@ -158,6 +158,72 @@ def test_propose_category_uses_merchant_cascade(tmp_path):
     assert reimburse_flow._propose_category(conn, cfg, "brand new cafe xyz", {})[0] is None
 
 
+def test_billable_reimbursement_asks_for_client_then_resolves(tmp_path, monkeypatch):
+    """Erica's smoke-test gap: when a reimbursement becomes Billable Expense, Penny
+    must ask which client to bill, then capture it (single match resolves; the row
+    isn't 'submitted' until a client is set)."""
+    import cfo_agent.engine.reimburse_parse as rp
+    from cfo_agent.engine import reply_flow
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(reply_flow, "_projects", lambda cfg, month: [
+        "Colgate Skin Health – Reorg Support", "Genentech L&SD Sprint"])
+    # Gas: auto-proposed General Travel (low conf), shortlist includes Billable Expense.
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 5200, "business_purpose": "Gas for Colgate delivery",
+        "expense_date": "2026-07-31", "proposed_coa_line": "General Travel",
+        "category_confidence": "low",
+        "category_options": ["General Travel", "Billable Expense"]})
+    res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                        "Gas on the way to Colgate delivery for $52",
+                                        "2026-07", source_dm_ts="1730000000.1")
+    assert res["status"] == "submitted"        # General Travel isn't billable
+    # Pick option 2 (Billable Expense) -> Penny must now ask which client.
+    res2 = reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                           "2", "2026-07", thread_ts="1730000000.1")
+    assert res2["status"] == "needs_info"
+    assert "client" in res2["confirm_back"].lower()
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-1730000000.1")
+    assert row["billable"] == 1 and not row["project"]
+    # Name the client -> single Colgate project resolves it -> submitted.
+    res3 = reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                           "Colgate", "2026-07", thread_ts="1730000000.1")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-1730000000.1")
+    assert row["project"] == "Colgate Skin Health – Reorg Support"
+    assert res3["status"] == "submitted"
+
+
+def test_billable_ambiguous_client_offers_numbered_pick(tmp_path, monkeypatch):
+    """An account with several active projects -> Penny offers a numbered client
+    pick-list; a bare-number reply resolves it."""
+    import cfo_agent.engine.reimburse_parse as rp
+    from cfo_agent.engine import reply_flow
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(reply_flow, "_projects", lambda cfg, month: [
+        "Genentech L&SD Sprint", "Genentech External Affairs Leadership Forum",
+        "Colgate Skin Health – Reorg Support"])
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 8000, "business_purpose": "client dinner",
+        "expense_date": "2026-07-20", "proposed_coa_line": "Billable Expense",
+        "category_confidence": "high", "category_options": ["Billable Expense"]})
+    res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                        "reimburse $80 client dinner", "2026-07",
+                                        source_dm_ts="1730000000.2")
+    assert res["status"] == "needs_info" and "client" in res["confirm_back"].lower()
+    # "Genentech" is ambiguous (two projects) -> numbered pick-list.
+    res2 = reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                           "Genentech", "2026-07", thread_ts="1730000000.2")
+    cb = res2["confirm_back"].lower()
+    assert res2["status"] == "needs_info" and "1)" in cb and "2)" in cb
+    # Pick 2 -> resolves to the second Genentech project, submitted.
+    reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                    "2", "2026-07", thread_ts="1730000000.2")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-1730000000.2")
+    assert row["project"] == "Genentech External Affairs Leadership Forum"
+    assert row["status"] == "submitted"
+
+
 def test_receipt_required_only_at_threshold():
     from cfo_agent.engine.reimburse_flow import _missing_fields
     rc = load_client(CLIENT).section("reimbursements")   # threshold 10000 ($100)

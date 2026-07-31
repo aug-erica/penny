@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS reimbursements (
   currency          TEXT NOT NULL DEFAULT 'USD',
   business_purpose  TEXT,
   proposed_coa_line TEXT,
+  billable          INTEGER,
+  project           TEXT,
   receipt_status    TEXT,
   receipt_link      TEXT,
   status            TEXT NOT NULL DEFAULT 'submitted'
@@ -249,6 +251,30 @@ def mark_digest_posted(conn, client: str, close_month: str, post_date: str):
 _SCHEMA_READY = set()   # backends whose schema this process has already ensured
 
 
+def _ensure_reimb_columns(conn):
+    """Additively add the reimbursement billable/project columns if missing. Runs
+    even on the 'fully migrated' fast path (reimbursements already exists) because
+    those columns post-date the table. Safe on the live DB: reimbursements is tiny,
+    so the add is a fast metadata-only change under lock_timeout; any contention
+    just no-ops and retries on the next start."""
+    for col, decl in (("billable", "INTEGER"), ("project", "TEXT")):
+        try:
+            if conn.is_pg:
+                conn.execute(
+                    f"ALTER TABLE reimbursements ADD COLUMN IF NOT EXISTS {col} {decl}")
+            else:
+                try:
+                    conn.execute(f"ALTER TABLE reimbursements ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError:
+                    pass  # already present
+        except Exception:
+            pass
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+
 def open_db(path) -> db.Conn:
     conn = db.connect(path)
     # Ensure schema ONCE per process (not per call): a web service opens a fresh
@@ -268,6 +294,7 @@ def open_db(path) -> db.Conn:
         try:
             if conn.execute("SELECT 1 FROM information_schema.tables WHERE "
                             "table_name='reimbursements'").fetchone():
+                _ensure_reimb_columns(conn)   # additive, idempotent (tiny table)
                 _SCHEMA_READY.add(key)
                 return conn
         except Exception:
@@ -623,8 +650,8 @@ def history_detail(conn, client: str, merchant_norm: str) -> list:
 _REIMB_COLS = (
     "external_id", "client", "entity", "employee", "submitter_uid", "kind",
     "expense_date", "close_month", "submitted_at", "amount_cents", "currency",
-    "business_purpose", "proposed_coa_line", "receipt_status", "receipt_link",
-    "status", "source_dm_ts", "rationale",
+    "business_purpose", "proposed_coa_line", "billable", "project",
+    "receipt_status", "receipt_link", "status", "source_dm_ts", "rationale",
 )
 # Fields set_reimbursement_status may update (whitelist — never interpolate keys
 # from callers without this guard).
@@ -702,6 +729,7 @@ def set_reimbursement_status(conn, reimb_id: int, status: str, **fields):
 
 _REIMB_EDIT_FIELDS = frozenset({
     "amount_cents", "business_purpose", "proposed_coa_line", "expense_date",
+    "billable", "project",
 })
 
 

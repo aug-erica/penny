@@ -12,6 +12,10 @@ def _one_line(r: dict) -> str:
         parts.append(f"— {r['business_purpose']}")
     if r.get("proposed_coa_line"):
         parts.append(f"[{r['proposed_coa_line']}]")
+    if r.get("project"):
+        parts.append(f"→ billable to {r['project']}")
+    elif r.get("billable"):
+        parts.append("→ billable (client TBD)")
     return " ".join(p for p in parts if p)
 
 
@@ -42,6 +46,26 @@ def category_options_block(options: list) -> str:
 def bad_choice(first: str, n: int) -> str:
     rng = "1" if n == 1 else f"1–{n}"
     return f"Sorry {first} — I only listed {n} option{'s' if n != 1 else ''}. Reply with {rng}."
+
+
+def project_ask(first: str, r: dict, bot_name: str = "Penny") -> str:
+    """Billable reimbursement, no client yet — ask which client to bill. Open
+    question (the pal names the client; Penny fuzzy-matches active projects)."""
+    return (f"Got it, {first} — since this one's *billable*, which client/project "
+            f"should I bill it to? Just name the client (e.g. \"McCain\") and I'll "
+            f"match it to the right project.")
+
+
+def project_options_block(options: list) -> str:
+    """A numbered client/project pick-list — used when the client the pal named
+    matches several active projects (e.g. one account, multiple contracts)."""
+    if not options:
+        return ""
+    lines = ["A few could fit — which client/project should I bill this to? "
+             "Reply with the number:"]
+    for i, o in enumerate(options, 1):
+        lines.append(f"   {i}) {o}")
+    return "\n".join(lines)
 
 
 def clarify_intent(first: str) -> str:
