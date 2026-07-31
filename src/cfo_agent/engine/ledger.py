@@ -136,6 +136,9 @@ CREATE TABLE IF NOT EXISTS reimbursements (
   proposed_coa_line TEXT,
   billable          INTEGER,
   project           TEXT,
+  orig_currency     TEXT,
+  orig_amount_cents INTEGER,
+  group_id          TEXT,
   receipt_status    TEXT,
   receipt_link      TEXT,
   status            TEXT NOT NULL DEFAULT 'submitted'
@@ -257,7 +260,9 @@ def _ensure_reimb_columns(conn):
     those columns post-date the table. Safe on the live DB: reimbursements is tiny,
     so the add is a fast metadata-only change under lock_timeout; any contention
     just no-ops and retries on the next start."""
-    for col, decl in (("billable", "INTEGER"), ("project", "TEXT")):
+    for col, decl in (("billable", "INTEGER"), ("project", "TEXT"),
+                      ("orig_currency", "TEXT"), ("orig_amount_cents", "INTEGER"),
+                      ("group_id", "TEXT")):
         try:
             if conn.is_pg:
                 conn.execute(
@@ -651,6 +656,7 @@ _REIMB_COLS = (
     "external_id", "client", "entity", "employee", "submitter_uid", "kind",
     "expense_date", "close_month", "submitted_at", "amount_cents", "currency",
     "business_purpose", "proposed_coa_line", "billable", "project",
+    "orig_currency", "orig_amount_cents", "group_id",
     "receipt_status", "receipt_link", "status", "source_dm_ts", "rationale",
 )
 # Fields set_reimbursement_status may update (whitelist — never interpolate keys
@@ -697,6 +703,16 @@ def reimbursement_by_id(conn, reimb_id: int):
     return dict(r) if r else None
 
 
+def reimbursements_in_group(conn, client: str, group_id: str) -> list:
+    """All reimbursements from one multi-receipt submission (they share a group_id
+    = the intake message ts). Empty group_id -> just that row is its own group."""
+    if not group_id:
+        return []
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM reimbursements WHERE client=? AND group_id=? ORDER BY id",
+        (client, group_id))]
+
+
 def reimbursements_for(conn, client: str, month: str = None,
                        status=None) -> list:
     """List reimbursements for a client, optionally filtered by close_month and
@@ -729,7 +745,7 @@ def set_reimbursement_status(conn, reimb_id: int, status: str, **fields):
 
 _REIMB_EDIT_FIELDS = frozenset({
     "amount_cents", "business_purpose", "proposed_coa_line", "expense_date",
-    "billable", "project",
+    "billable", "project", "orig_currency", "orig_amount_cents",
 })
 
 

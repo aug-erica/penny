@@ -15,8 +15,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (db, disambiguate, ledger, receipt_read, receipt_store, reimburse_dm,
-               reimburse_parse, reimburse_policy)
+from . import (db, disambiguate, fx, ledger, projects, receipt_read, receipt_store,
+               reimburse_dm, reimburse_parse, reimburse_policy)
 from .continuous_close import _uid_for
 from .normalize import normalize_merchant
 
@@ -57,30 +57,47 @@ def _dashboard_url() -> str:
     return (env("DASHBOARD_URL") or "").rstrip("/") or None
 
 
-def _store_receipt(cfg, month, employee, purpose, amount_cents, expense_date,
-                   slack, file_ids):
-    """Download + store the first attached file as the receipt. Also fills a
-    missing amount from the receipt total and reads the merchant off the receipt
-    (used to sharpen the category proposal). Returns (receipt_status,
-    receipt_link, amount_cents, merchant). No file -> (None, None, amount_cents
-    unchanged, None)."""
-    if not (slack and file_ids):
-        return None, None, amount_cents, None
+def _ingest_receipt(cfg, month, employee, expense_date, slack, file_id):
+    """Download + store ONE receipt file and read its amount, merchant, and
+    currency (Claude). Returns {receipt_status, receipt_link, amount_cents,
+    merchant, currency} — all None-ish if there's no file or it can't be read."""
+    out = {"receipt_status": None, "receipt_link": None, "amount_cents": None,
+           "merchant": None, "currency": None}
+    if not (slack and file_id):
+        return out
     tmp = Path(tempfile.mktemp())
     try:
-        slack.download_file(file_ids[0], tmp)
+        slack.download_file(file_id, tmp)
         info = receipt_read.read_receipt(tmp)
-        if amount_cents is None and info.get("amount_cents"):
-            amount_cents = info["amount_cents"]
-        merchant = info.get("merchant") or None
-        pseudo = {"merchant_raw": (merchant or purpose or "reimbursement"),
-                  "amount_cents": amount_cents or 0, "txn_date": expense_date}
-        dest = receipt_store.store_file(cfg, month, employee, pseudo, tmp)
-        return "stored", str(dest), amount_cents, merchant
+        out["amount_cents"] = info.get("amount_cents")
+        out["merchant"] = info.get("merchant") or None
+        out["currency"] = info.get("currency")
+        pseudo = {"merchant_raw": (out["merchant"] or "reimbursement"),
+                  "amount_cents": out["amount_cents"] or 0, "txn_date": expense_date}
+        out["receipt_status"] = "stored"
+        out["receipt_link"] = str(receipt_store.store_file(cfg, month, employee, pseudo, tmp))
     except Exception:
-        return None, None, amount_cents, None
+        pass
     finally:
         tmp.unlink(missing_ok=True)
+    return out
+
+
+def _to_usd(amount_cents, currency, expense_date):
+    """Convert an original amount to what Penny should reimburse (USD). Returns
+    (amount_cents_to_pay, orig_currency, orig_amount_cents, rate):
+      - USD or unknown currency -> pay as-is, no orig marker.
+      - non-USD, converted -> pay the USD amount; keep the original for the record.
+      - non-USD, rate unavailable -> pay the original (flagged), keep the marker so
+        the reviewer converts.
+    """
+    cur = (currency or "USD").upper()
+    if amount_cents is None or cur == "USD":
+        return amount_cents, None, None, None
+    usd, rate = fx.to_usd_cents(amount_cents, cur, expense_date)
+    if usd is not None:
+        return usd, cur, amount_cents, rate
+    return amount_cents, cur, amount_cents, None   # couldn't convert -> flag as-is
 
 
 # Events that carry a pending numbered pick-list Penny offered the employee, per
@@ -118,23 +135,23 @@ def _is_billable(cfg, coa) -> bool:
     return bool(coa) and coa in (cfg.section("billable").get("billable_categories") or [])
 
 
-def _resolve_project(text: str, projects: list):
-    """Read a client/project out of a free-text reply. Returns (project, options):
-    a confident single match -> (name, None); several plausible ones (e.g. one
-    client with multiple projects) -> (None, shortlist) for a numbered pick; nothing
-    close -> (None, None)."""
-    low = (text or "").strip().lower()
-    if not low or not projects:
-        return None, None
-    contains = [p for p in projects if low in p.lower() or p.lower() in low]
-    if len(contains) == 1:
-        return contains[0], None
-    if len(contains) > 1:
-        return None, contains[:5]
-    one = disambiguate.fuzzy_one(text, projects)
-    if one:
-        return one, None
-    return None, (disambiguate.shortlist(text, projects, limit=3) or None)
+def _propagate_group(conn, cfg, anchor):
+    """Apply the anchor's shared fields (category, billable, client) to its
+    multi-receipt siblings and re-finalize each one's status by its OWN basics
+    (a sibling still missing an amount stays needs_info)."""
+    gid = anchor.get("group_id")
+    if not gid:
+        return
+    rc = cfg.section("reimbursements")
+    for m in ledger.reimbursements_in_group(conn, cfg.client, gid):
+        if m["id"] == anchor["id"] or m["status"] in ("approved", "exported", "paid"):
+            continue
+        ledger.update_reimbursement_fields(
+            conn, m["id"], proposed_coa_line=anchor.get("proposed_coa_line"),
+            billable=anchor.get("billable"), project=anchor.get("project"))
+        mm = _missing_fields(rc, m.get("amount_cents"), m.get("business_purpose"),
+                             anchor.get("proposed_coa_line"), m.get("receipt_status"))
+        ledger.set_reimbursement_status(conn, m["id"], "needs_info" if mm else "submitted")
 
 
 def _ack_or_ask_client(conn, cfg, ext, rid, first, slack, cat_conf="high",
@@ -143,7 +160,8 @@ def _ack_or_ask_client(conn, cfg, ext, rid, first, slack, cat_conf="high",
     in. Persists the billable flag; if the category is billable but no client is
     set yet, asks which client to bill (numbered pick-list when one was offered,
     else an open ask) instead of acking; otherwise acks + notifies the approver.
-    Returns (status, fresh_row, confirm_back)."""
+    Propagates shared fields to any multi-receipt siblings. Returns (status,
+    fresh_row, confirm_back)."""
     row = ledger.reimbursement_by_id(conn, rid)
     billable = _is_billable(cfg, row.get("proposed_coa_line"))
     if bool(row.get("billable")) != billable:
@@ -160,10 +178,16 @@ def _ack_or_ask_client(conn, cfg, ext, rid, first, slack, cat_conf="high",
         return "needs_info", row, cb
     ledger.set_reimbursement_status(conn, rid, "submitted")
     row = ledger.reimbursement_by_id(conn, rid)
-    cb = reimburse_dm.ack_intake(first, row)
-    if cat_options:
-        cb += reimburse_dm.category_options_block(cat_options)
-    _notify_approver(cfg, row, slack, low_confidence=(cat_conf == "low"))
+    _propagate_group(conn, cfg, row)
+    if row.get("group_id"):
+        grp = ledger.reimbursements_in_group(conn, cfg.client, row["group_id"])
+        cb = reimburse_dm.group_ack(first, grp, 0, need_client=False)
+        _notify_approver_group(cfg, grp, slack)
+    else:
+        cb = reimburse_dm.ack_intake(first, row)
+        if cat_options:
+            cb += reimburse_dm.category_options_block(cat_options)
+        _notify_approver(cfg, row, slack, low_confidence=(cat_conf == "low"))
     return "submitted", row, cb
 
 
@@ -208,79 +232,125 @@ def _missing_fields(rc, amount_cents, purpose, coa, receipt_status) -> list:
     return missing
 
 
+def _fx_rationale(cat_conf, coa, orig_cur, orig_amt_cents, rate):
+    rat = f"auto-proposed ({cat_conf} confidence)" if coa else None
+    if orig_cur:
+        conv = f"{orig_cur} {(orig_amt_cents or 0) / 100:.2f}"
+        conv += f" @ {rate:.4f} → USD" if rate else " (rate TBD — reviewer confirms)"
+        rat = (rat + "; " if rat else "") + f"converted from {conv}"
+    return rat
+
+
 def process_intake(conn, cfg, employee, uid, text, month,
                    slack=None, file_ids=None, source_dm_ts=None) -> dict:
-    """Handle a reimbursement-intake message (one starting with the trigger word).
-    Creates a reimbursement row (status 'submitted' if complete, else 'needs_info'),
-    stores the receipt, notifies the approver, and returns
-    {reimbursement, status, confirm_back}."""
+    """Handle a reimbursement-intake message. One receipt → one reimbursement;
+    SEVERAL receipts in one message → one reimbursement per receipt (a group), all
+    sharing the purpose/category/client the pal gave once. Reads each receipt's
+    amount + currency, converts non-USD to USD (flagged for the reviewer), proposes
+    the category, and resolves the billable client from the message when it can.
+    Returns {reimbursement (anchor), status, confirm_back}."""
     rc = cfg.section("reimbursements")
     first = employee.split()[0]
+    files = list(file_ids or [])
+    msg_currency = fx.detect_currency(text)
 
-    # Store the receipt FIRST so its merchant can sharpen the category proposal
-    # (parse below runs with that merchant). Amount from the receipt is a fallback.
-    receipt_status, receipt_link, receipt_amount, merchant = _store_receipt(
-        cfg, month, employee, None, None, _today(), slack, file_ids)
+    # Read each attached receipt (amount / merchant / currency). No files -> one slot.
+    ings = [_ingest_receipt(cfg, month, employee, _today(), slack, fid) for fid in files]
+    first_merchant = next((g["merchant"] for g in ings if g.get("merchant")), None)
 
     parsed = reimburse_parse.interpret_reimbursement(
-        cfg.client, text, cfg.coa_lines, _today(), merchant=merchant)
-
-    amount_cents = parsed.get("amount_cents") or receipt_amount
+        cfg.client, text, cfg.coa_lines, _today(), merchant=first_merchant)
     purpose = parsed.get("business_purpose")
     expense_date = parsed.get("expense_date") or _today()
-    # Penny PROPOSES the category (the employee never has to name one). A known
-    # merchant hits the deterministic flywheel; else the LLM's ranked guess stands.
-    coa, cat_conf, cat_options = _propose_category(conn, cfg, merchant, parsed)
+    coa, cat_conf, cat_options = _propose_category(conn, cfg, first_merchant, parsed)
     offer_shortlist = cat_conf in ("low", "medium") and len(cat_options) >= 2
+    billable = _is_billable(cfg, coa)
+    # If billable, try to resolve the client straight from the message ("all
+    # billable to the Gilead project") — active list + live HubSpot search.
+    project = projects.resolve(cfg, month, text)[0] if billable else None
 
-    missing = _missing_fields(rc, amount_cents, purpose, coa, receipt_status)
-    ext = f"reimb-{source_dm_ts}" if source_dm_ts else f"reimb-{uuid.uuid4().hex[:16]}"
-    status = "needs_info" if missing else "submitted"
-    r = {
-        "external_id": ext, "client": cfg.client,
-        "entity": cfg.raw.get("entity") or "August", "employee": employee,
-        "submitter_uid": uid, "kind": "one_off", "expense_date": expense_date,
-        "close_month": month, "amount_cents": amount_cents or 0, "currency": "USD",
-        "business_purpose": purpose, "proposed_coa_line": coa,
-        "rationale": f"auto-proposed ({cat_conf} confidence)" if coa else None,
-        "receipt_status": receipt_status, "receipt_link": receipt_link,
-        "status": status, "source_dm_ts": source_dm_ts,
-    }
-    rid = ledger.create_reimbursement(conn, r)
-    row = ledger.reimbursement_by_id(conn, rid)
-    ledger.record_reimbursement_event(
-        conn, cfg.client, ext, status,
-        {"missing": missing, "amount_cents": amount_cents,
-         "proposed_coa_line": coa, "category_confidence": cat_conf},
-        actor=employee, source="slack" if slack else "cli")
-    # Remember the shortlist so a bare-number reply ("2") in this thread resolves it.
-    if offer_shortlist:
-        ledger.record_reimbursement_event(conn, cfg.client, ext, _CATEGORY_OPTS,
-                                          {"options": cat_options}, actor="system",
-                                          source="penny")
+    slots = ings or [{"receipt_status": None, "receipt_link": None,
+                      "amount_cents": parsed.get("amount_cents"), "currency": None}]
+    ext_base = source_dm_ts or uuid.uuid4().hex[:16]
+    group_id = ext_base if len(slots) > 1 else None
 
-    violations = reimburse_policy.check(cfg, amount_cents, purpose, coa,
-                                        expense_date, _today())
-    if violations:
-        ledger.record_reimbursement_event(conn, cfg.client, ext, "policy_flag",
-                                          {"violations": violations},
-                                          actor="system", source="policy")
+    created, last_violations = [], []
+    for i, g in enumerate(slots):
+        cur = msg_currency or g.get("currency") or "USD"
+        pay_cents, orig_cur, orig_amt_cents, rate = _to_usd(
+            g.get("amount_cents"), cur, expense_date)
+        ext = f"reimb-{ext_base}" if i == 0 else f"reimb-{ext_base}-{i + 1}"
+        r = {
+            "external_id": ext, "client": cfg.client,
+            "entity": cfg.raw.get("entity") or "August", "employee": employee,
+            "submitter_uid": uid, "kind": "one_off", "expense_date": expense_date,
+            "close_month": month, "amount_cents": pay_cents or 0, "currency": "USD",
+            "business_purpose": purpose, "proposed_coa_line": coa,
+            "billable": 1 if billable else 0, "project": project,
+            "orig_currency": orig_cur, "orig_amount_cents": orig_amt_cents,
+            "group_id": group_id,
+            "rationale": _fx_rationale(cat_conf, coa, orig_cur, orig_amt_cents, rate),
+            "receipt_status": g.get("receipt_status"), "receipt_link": g.get("receipt_link"),
+            "status": "submitted", "source_dm_ts": source_dm_ts,
+        }
+        rid = ledger.create_reimbursement(conn, r)
+        row = ledger.reimbursement_by_id(conn, rid)
+        ledger.record_reimbursement_event(
+            conn, cfg.client, ext, "intake",
+            {"amount_cents": pay_cents, "proposed_coa_line": coa,
+             "category_confidence": cat_conf, "orig_currency": orig_cur,
+             "orig_amount_cents": orig_amt_cents, "fx_rate": rate, "group_id": group_id},
+            actor=employee, source="slack" if slack else "cli")
+        if offer_shortlist and i == 0:
+            ledger.record_reimbursement_event(conn, cfg.client, ext, _CATEGORY_OPTS,
+                                              {"options": cat_options}, actor="system",
+                                              source="penny")
+        v = reimburse_policy.check(cfg, pay_cents, purpose, coa, expense_date, _today())
+        if v:
+            ledger.record_reimbursement_event(conn, cfg.client, ext, "policy_flag",
+                                              {"violations": v}, actor="system", source="policy")
+            last_violations = v
+        created.append(row)
 
-    if missing:
-        # The row now exists and Penny's ask is threaded under it, so guide the
-        # employee to REPLY IN THIS THREAD — never to start a new "reimburse"
-        # message (that used to spawn duplicate rows, e.g. Melissa's exchange).
-        cb = reimburse_dm.needs_info(first, row, missing,
-                                     trigger=rc.get("trigger", "reimburse"),
-                                     followup=True)
-    else:
-        # Basics are in — ack, or (if the category is billable) ask which client.
-        status, row, cb = _ack_or_ask_client(
-            conn, cfg, ext, rid, first, slack, cat_conf=cat_conf,
-            cat_options=cat_options if offer_shortlist else None)
-    cb += reimburse_dm.policy_warning(violations)
+    anchor = created[0]
+    ext, rid = anchor["external_id"], anchor["id"]
 
-    return {"reimbursement": row, "status": status, "confirm_back": cb}
+    # --- Single receipt: unchanged tail (missing basics -> ask; else ack/ask-client).
+    if len(created) == 1:
+        row = anchor
+        missing = _missing_fields(rc, row.get("amount_cents"), purpose, coa,
+                                  row.get("receipt_status"))
+        if missing:
+            ledger.set_reimbursement_status(conn, rid, "needs_info")
+            row = ledger.reimbursement_by_id(conn, rid)
+            cb = reimburse_dm.needs_info(first, row, missing,
+                                         trigger=rc.get("trigger", "reimburse"),
+                                         followup=True)
+            status = "needs_info"
+        else:
+            status, row, cb = _ack_or_ask_client(
+                conn, cfg, ext, rid, first, slack, cat_conf=cat_conf,
+                cat_options=cat_options if offer_shortlist else None)
+        cb += reimburse_dm.policy_warning(last_violations)
+        return {"reimbursement": row, "status": status, "confirm_back": cb}
+
+    # --- Group (several receipts): shared client, per-receipt amounts.
+    unreadable = [r for r in created if not r.get("amount_cents")]
+    for r in unreadable:                      # a receipt Penny couldn't read an amount from
+        ledger.set_reimbursement_status(conn, r["id"], "needs_info")
+    need_client = billable and not project
+    if need_client:
+        for r in created:
+            ledger.set_reimbursement_status(conn, r["id"], "needs_info")
+        ledger.record_reimbursement_event(conn, cfg.client, ext, "project_prompt", {},
+                                          actor="system", source="penny")
+    status = "needs_info" if (unreadable or need_client) else "submitted"
+    fresh = ledger.reimbursements_in_group(conn, cfg.client, group_id)
+    cb = reimburse_dm.group_ack(first, fresh, len(unreadable), need_client)
+    if not (unreadable or need_client):
+        _notify_approver_group(cfg, fresh, slack)
+    cb += reimburse_dm.policy_warning(last_violations)
+    return {"reimbursement": anchor, "status": status, "confirm_back": cb}
 
 
 def process_followup(conn, cfg, employee, uid, text, month,
@@ -340,18 +410,22 @@ def process_followup(conn, cfg, employee, uid, text, month,
         cb = reimburse_dm.bad_choice(first, len(opts))
         return {"reimbursement": row, "status": row["status"], "confirm_back": cb}
 
-    # A receipt sent in the follow-up gets stored now (so it's never lost) and its
-    # merchant sharpens the category; if we already had one, keep it.
+    # A receipt sent in the follow-up gets stored now (so it's never lost), its
+    # merchant sharpens the category, and a foreign-currency total is converted.
     receipt_status = row.get("receipt_status")
     receipt_link = row.get("receipt_link")
     merchant = None
     receipt_amount = None
+    fu_orig_cur = fu_orig_amt = None
     if slack and file_ids:
-        rs, rl, receipt_amount, merchant = _store_receipt(
-            cfg, month, employee, row.get("business_purpose"),
-            None, row.get("expense_date") or _today(), slack, file_ids)
-        if rs == "stored":
-            receipt_status, receipt_link = rs, rl
+        g = _ingest_receipt(cfg, month, employee,
+                            row.get("expense_date") or _today(), slack, file_ids[0])
+        merchant = g.get("merchant")
+        if g.get("receipt_status") == "stored":
+            receipt_status, receipt_link = g["receipt_status"], g["receipt_link"]
+        cur = fx.detect_currency(text) or g.get("currency") or "USD"
+        receipt_amount, fu_orig_cur, fu_orig_amt, _rate = _to_usd(
+            g.get("amount_cents"), cur, row.get("expense_date") or _today())
 
     parsed = reimburse_parse.interpret_reimbursement(
         cfg.client, text, cfg.coa_lines, row.get("expense_date") or _today(),
@@ -375,7 +449,8 @@ def process_followup(conn, cfg, employee, uid, text, month,
 
     ledger.update_reimbursement_fields(
         conn, row["id"], amount_cents=amount_cents, business_purpose=purpose,
-        proposed_coa_line=coa, expense_date=expense_date)
+        proposed_coa_line=coa, expense_date=expense_date,
+        orig_currency=fu_orig_cur, orig_amount_cents=fu_orig_amt)
     if receipt_status == "stored" and row.get("receipt_status") != "stored":
         ledger.set_reimbursement_receipt(conn, row["id"], "stored", receipt_link)
 
@@ -384,12 +459,11 @@ def process_followup(conn, cfg, employee, uid, text, month,
                                           {"options": cat_options}, actor="system",
                                           source="penny")
 
-    # Billable + no client yet -> read a client from this reply (a name resolves it;
-    # an ambiguous client — e.g. several projects for one account — offers a pick).
+    # Billable + no client yet -> read a client from this reply (a name resolves it,
+    # searching the active list + live HubSpot; an ambiguous client — e.g. several
+    # projects for one account — offers a numbered pick).
     if _is_billable(cfg, coa) and not row.get("project"):
-        from . import reply_flow
-        projects = reply_flow._projects(cfg, month)
-        proj, proj_opts = _resolve_project(text, projects)
+        proj, proj_opts = projects.resolve(cfg, month, text)
         if proj:
             ledger.update_reimbursement_fields(conn, row["id"], project=proj)
             ledger.record_reimbursement_event(conn, cfg.client, ext, "project_set",
@@ -440,6 +514,20 @@ def _notify_approver(cfg, row: dict, slack, low_confidence: bool = False):
     try:
         slack.send_dm(uid, reimburse_dm.approval_request(
             row, _dashboard_url(), low_confidence=low_confidence))
+    except Exception:
+        pass
+
+
+def _notify_approver_group(cfg, rows: list, slack):
+    """One DM to the approver for a multi-receipt submission (best-effort)."""
+    if not slack or not rows:
+        return
+    approver = approver_for(cfg, rows[0]["employee"])
+    uid = _uid_for(cfg, approver)
+    if not uid:
+        return
+    try:
+        slack.send_dm(uid, reimburse_dm.approval_request_group(rows, _dashboard_url()))
     except Exception:
         pass
 

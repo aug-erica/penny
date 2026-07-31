@@ -64,7 +64,11 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     receipts, confirm_back}. `slack` is a PennySlack for downloading files."""
     charges = _pal_charges(conn, cfg.client, month, cardholder)
     by_ext = {c["external_id"]: c for c in charges}
-    projects = _projects(cfg, month)
+    # Candidate projects = this month's active list PLUS live HubSpot Closed-Won
+    # matches for what the pal wrote — so a long-closed or out-of-window project
+    # (e.g. Waymo) can still be tagged, not just the current month's deals.
+    from . import projects as project_lookup
+    projects = project_lookup.candidates(cfg, month, text)
     result = {"decisions": 0, "recats": 0, "rules": 0, "receipts": 0}
     touched = set()   # external_ids changed by THIS reply (scopes the confirm-back)
 

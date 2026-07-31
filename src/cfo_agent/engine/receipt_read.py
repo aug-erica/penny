@@ -15,9 +15,12 @@ from ..config import env
 
 MODEL = "claude-haiku-4-5-20251001"
 _PROMPT = ('This is an expense receipt or invoice. Return ONLY JSON: '
-           '{"merchant":"<store/vendor name, or null>","total_usd":<final total '
-           'actually paid as a number, or null>}. The total is the grand total '
-           'including tax/tip, not a subtotal or line item.')
+           '{"merchant":"<store/vendor name, or null>","total":<final total '
+           'actually paid as a number, or null>,"currency":"<3-letter ISO code of '
+           'the total, e.g. USD, CAD, EUR; USD if unclear>"}. The total is the '
+           'grand total including tax/tip, not a subtotal or line item. Read the '
+           'currency from the symbols/text on the receipt (e.g. "CAD", "C$", "$" '
+           'with a Canadian merchant -> CAD).')
 
 
 def _media(raw: bytes):
@@ -36,7 +39,8 @@ def _media(raw: bytes):
 
 
 def read_receipt(path) -> dict:
-    """{"merchant": str|None, "amount_cents": int|None} — or {} if unreadable."""
+    """{"merchant": str|None, "amount_cents": int|None, "currency": str} — or {}
+    if unreadable. `currency` is the ISO code the total is in (defaults "USD")."""
     api_key = env("ANTHROPIC_API_KEY")
     if not api_key:
         return {}
@@ -58,6 +62,10 @@ def read_receipt(path) -> dict:
         d = json.loads(text[text.index("{"):text.rindex("}") + 1])
     except Exception:
         return {}
-    total = d.get("total_usd")
+    total = d.get("total")
+    cur = (d.get("currency") or "USD").strip().upper()
+    if len(cur) != 3:
+        cur = "USD"
     return {"merchant": d.get("merchant") or None,
-            "amount_cents": round(total * 100) if isinstance(total, (int, float)) and total else None}
+            "amount_cents": round(total * 100) if isinstance(total, (int, float)) and total else None,
+            "currency": cur}

@@ -6,8 +6,15 @@ from __future__ import annotations
 from .dm_assemble import _money
 
 
+def _orig(r: dict) -> str:
+    """'(CAD 14.79)' when the reimbursement was converted from a foreign currency."""
+    if r.get("orig_currency") and r.get("orig_amount_cents"):
+        return f"({r['orig_currency']} {r['orig_amount_cents'] / 100:.2f})"
+    return ""
+
+
 def _one_line(r: dict) -> str:
-    parts = [_money(r["amount_cents"]), r.get("expense_date") or ""]
+    parts = [_money(r["amount_cents"]), _orig(r), r.get("expense_date") or ""]
     if r.get("business_purpose"):
         parts.append(f"— {r['business_purpose']}")
     if r.get("proposed_coa_line"):
@@ -134,9 +141,51 @@ def approval_request(r: dict, dashboard_url: str = None,
     line = f"*{emp}* — {_one_line(r)}"
     flag = ("\n   ⚠️ *category is my best guess — worth a double-check*"
             if low_confidence else "")
+    if r.get("orig_currency"):
+        flag += (f"\n   💱 *converted from {r['orig_currency']} — confirm the rate "
+                 f"before payout*")
     tail = (f"\nApprove or reject in the queue: {dashboard_url}/reimbursements"
             if dashboard_url else "\nApprove or reject it in the reimbursements queue.")
     return f"🧾 New reimbursement to review:\n   • {line}{flag}{tail}"
+
+
+def approval_request_group(rows: list, dashboard_url: str = None) -> str:
+    emp = rows[0].get("employee", "someone")
+    total = sum(r.get("amount_cents") or 0 for r in rows)
+    proj = rows[0].get("project")
+    head = (f"🧾 New reimbursements to review — *{emp}*, {len(rows)} receipts, "
+            f"{_money(total)}")
+    if proj:
+        head += f" → billable to {proj}"
+    if any(r.get("orig_currency") for r in rows):
+        head += "\n   💱 *some were converted to USD — confirm the rate before payout*"
+    tail = (f"\nApprove in the queue: {dashboard_url}/reimbursements"
+            if dashboard_url else "\nApprove them in the reimbursements queue.")
+    return head + tail
+
+
+def group_ack(first: str, rows: list, unreadable: int, need_client: bool,
+              bot_name: str = "Penny") -> str:
+    """Ack for a multi-receipt submission: one line per receipt + a running total,
+    a note on any Penny couldn't read, and (if billable) the single client ask."""
+    n = len(rows)
+    total = sum(r.get("amount_cents") or 0 for r in rows)
+    coa = rows[0].get("proposed_coa_line")
+    head = (f"Got it, {first} — logged *{n} reimbursements* from your receipts, "
+            f"totaling {_money(total)}" + (f" [{coa}]" if coa else "") + ":")
+    lines = [head]
+    for r in rows:
+        bit = f"   • {_money(r['amount_cents'])} {_orig(r)}".rstrip()
+        lines.append(bit)
+    if unreadable:
+        lines.append(f"⚠️ I couldn't read an amount on {unreadable} of them — "
+                     f"reply with the amount(s) and I'll finish those.")
+    body = "\n".join(lines)
+    if need_client:
+        body += "\n\n" + project_ask(first, rows[0])
+    elif not unreadable:
+        body += "\n\nThey're in the approval queue now; I'll confirm once approved. 🧾"
+    return body
 
 
 def approved(first: str, r: dict, bot_name: str = "Penny") -> str:

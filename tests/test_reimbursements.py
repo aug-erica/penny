@@ -224,6 +224,72 @@ def test_billable_ambiguous_client_offers_numbered_pick(tmp_path, monkeypatch):
     assert row["status"] == "submitted"
 
 
+class _FakeSlack:
+    def download_file(self, *a, **k):
+        pass
+
+    def send_dm(self, *a, **k):
+        pass
+
+
+def test_single_foreign_receipt_converts_to_usd(monkeypatch, tmp_path):
+    """A CAD receipt is converted to USD, the original is kept, and it's flagged."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": None, "business_purpose": "Waymo ride", "expense_date": "2026-07-15",
+        "proposed_coa_line": "General Travel", "category_confidence": "high",
+        "category_options": ["General Travel"]})
+    monkeypatch.setattr(reimburse_flow, "_ingest_receipt", lambda *a, **k: {
+        "receipt_status": "stored", "receipt_link": "d1", "amount_cents": 1479,
+        "merchant": "Waymo", "currency": "CAD"})
+    monkeypatch.setattr(reimburse_flow.fx, "to_usd_cents", lambda c, cur, d: (round(c * 0.73), 0.73))
+    res = reimburse_flow.process_intake(conn, cfg, "Alexis Black", "UDFF86K8V",
+                                        "Waymo ride, in CAD", "2026-07",
+                                        slack=_FakeSlack(), file_ids=["f1"], source_dm_ts="C1")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-C1")
+    assert row["orig_currency"] == "CAD" and row["orig_amount_cents"] == 1479
+    assert row["amount_cents"] == round(1479 * 0.73)      # stored in USD
+    assert res["status"] == "submitted" and "CAD" in res["confirm_back"]
+
+
+def test_multi_receipt_group_currency_and_client_propagation(monkeypatch, tmp_path):
+    """Several receipts in one message -> one row each (a group), CAD converted,
+    the billable client asked ONCE and propagated to every row."""
+    import cfo_agent.engine.reimburse_parse as rp
+    from cfo_agent.engine import projects as pj
+    from cfo_agent.adapters.projects import hubspot_client
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": None, "business_purpose": "Gilead dinners", "expense_date": "2026-07-15",
+        "proposed_coa_line": "Billable Expense", "category_confidence": "high",
+        "category_options": ["Billable Expense"]})
+    monkeypatch.setattr(pj, "active_names", lambda c, m: ["Gilead Manufacturing Team Leadership"])
+    monkeypatch.setattr(hubspot_client, "search_closed_won", lambda t, limit=10: [])
+    monkeypatch.setattr(reimburse_flow.fx, "to_usd_cents", lambda c, cur, d: (round(c * 0.73), 0.73))
+    seq = iter([
+        {"receipt_status": "stored", "receipt_link": "d1", "amount_cents": 2000, "merchant": "A", "currency": "CAD"},
+        {"receipt_status": "stored", "receipt_link": "d2", "amount_cents": 3000, "merchant": "B", "currency": "CAD"}])
+    monkeypatch.setattr(reimburse_flow, "_ingest_receipt", lambda *a, **k: next(seq))
+    res = reimburse_flow.process_intake(conn, cfg, "Alexis Black", "UDFF86K8V",
+                                        "Reimburse: read these, all billable, in CAD",
+                                        "2026-07", slack=_FakeSlack(),
+                                        file_ids=["f1", "f2"], source_dm_ts="G1")
+    grp = ledger.reimbursements_in_group(conn, CLIENT, "G1")
+    assert len(grp) == 2
+    assert all(r["billable"] == 1 and r["orig_currency"] == "CAD" for r in grp)
+    assert grp[0]["amount_cents"] == round(2000 * 0.73)
+    assert res["status"] == "needs_info" and "client" in res["confirm_back"].lower()
+    # Alexis names the client once -> resolves and propagates to BOTH rows.
+    reimburse_flow.process_followup(conn, cfg, "Alexis Black", "UDFF86K8V",
+                                    "Gilead Manufacturing", "2026-07", thread_ts="G1")
+    grp = ledger.reimbursements_in_group(conn, CLIENT, "G1")
+    assert all(r["project"] == "Gilead Manufacturing Team Leadership" for r in grp)
+    assert all(r["status"] == "submitted" for r in grp)
+
+
 def test_receipt_required_only_at_threshold():
     from cfo_agent.engine.reimburse_flow import _missing_fields
     rc = load_client(CLIENT).section("reimbursements")   # threshold 10000 ($100)
