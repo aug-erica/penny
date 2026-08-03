@@ -36,6 +36,17 @@ def test_wordless_no_signal_is_ambiguous_without_llm():
     assert intent.classify("august", "thanks!", False, False, PROJECTS) == "ambiguous"
 
 
+def test_reply_matching_existing_charge_is_card_not_reimbursement():
+    # A reply that quotes an existing card charge's amount ("$38.39 is billable")
+    # is answering Penny about THAT charge — not a new out-of-pocket expense.
+    charges = [3839, 1120]  # cents of the pal's known card charges
+    assert intent.classify("august", "07-28 LYFT *AIRPORT 07-29 $38.39 is billable",
+                           False, False, PROJECTS, charge_amounts=charges) == "card"
+    # A typed amount that does NOT match a known charge is still a reimbursement.
+    assert intent.classify("august", "$42 team lunch", False, False, PROJECTS,
+                           charge_amounts=charges) == "reimbursement"
+
+
 def test_interpret_answer():
     assert intent.interpret_answer("reimbursement") == "reimbursement"
     assert intent.interpret_answer("out of pocket, I paid") == "reimbursement"

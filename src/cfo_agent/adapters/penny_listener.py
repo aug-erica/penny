@@ -49,13 +49,6 @@ def _load_pending(key: str, now_ts: str):
     return d
 
 
-def _awaiting_receipts(conn, cfg, employee: str, month: str) -> bool:
-    """True if this pal has card charges still missing a receipt — so a bare
-    receipt they send is probably answering that, not a brand-new expense."""
-    charges = reply_flow._pal_charges(conn, cfg.client, month, employee)
-    return bool([c for c in receipts.receipt_needed(charges)
-                 if c.get("receipt_status") != "stored"])
-
 # Daily digest posts around this hour UTC (~9am ET). The scheduler checks a few
 # times an hour and posts once/day during the first week (guarded in the DB).
 _DIGEST_HOUR_UTC = 13
@@ -321,10 +314,13 @@ def run(client_name: str, month: str):
             # 4) Wordless, pal-initiated top-level DM -> classify intent.
             if not thread_ts:
                 month = active_month()
+                pal_charges = reply_flow._pal_charges(conn, cfg.client, month, employee)
                 projects = reply_flow._projects(cfg, month)
-                awaiting = _awaiting_receipts(conn, cfg, employee, month)
+                awaiting = bool([c for c in receipts.receipt_needed(pal_charges)
+                                 if c.get("receipt_status") != "stored"])
+                amts = [c["amount_cents"] for c in pal_charges if c.get("amount_cents")]
                 kind = intent.classify(cfg.client, text, bool(file_ids),
-                                       awaiting, projects)
+                                       awaiting, projects, charge_amounts=amts)
                 if kind == "reimbursement":
                     _intake(text, msg_ts, file_ids)
                     return

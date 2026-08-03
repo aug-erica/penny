@@ -36,6 +36,10 @@ def has_money(text: str) -> bool:
     return bool(_AMOUNT.search(text or ""))
 
 
+def _amounts_cents(text: str) -> set:
+    return {round(float(a.replace(",", "")) * 100) for a in _AMOUNT.findall(text or "")}
+
+
 def mentions_project(text: str, projects: list) -> bool:
     """The reply names an active project (exact or a confident fuzzy match) — i.e.
     it's answering Penny's 'which project?' about a card charge."""
@@ -54,17 +58,23 @@ def looks_like_card_answer(text: str, projects: list) -> bool:
 
 
 def classify(client: str, text: str, has_receipt: bool, awaiting_receipts: bool,
-             projects: list) -> str:
+             projects: list, charge_amounts=None) -> str:
     """Return 'reimbursement' | 'card' | 'ambiguous' for a wordless, pal-initiated
     top-level DM. `awaiting_receipts` = the pal has card charges still missing a
-    receipt (so a bare receipt is probably answering that, not a new expense)."""
+    receipt (so a bare receipt is probably answering that, not a new expense).
+    `charge_amounts` = cents of the pal's existing card charges — a reply whose
+    amount matches one is about THAT charge (a card answer), not a new expense."""
     t = (text or "").strip()
 
+    # References an existing card charge by amount ("$38.39 is billable") -> it's
+    # answering Penny's question about that charge, not a new out-of-pocket expense.
+    if charge_amounts and (_amounts_cents(t) & set(charge_amounts)):
+        return "card"
     # A clear card-charge answer with no new dollar amount -> card flow.
     if looks_like_card_answer(t, projects) and not has_money(t):
         return "card"
-    # A dollar amount the pal typed themselves -> they're telling us about a new
-    # out-of-pocket expense.
+    # A dollar amount the pal typed themselves (not matching a known charge) ->
+    # they're telling us about a new out-of-pocket expense.
     if has_money(t):
         return "reimbursement"
     # A bare receipt with little/no description (no amount, no card cue): if Penny
