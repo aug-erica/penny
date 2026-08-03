@@ -10,9 +10,14 @@ Definition of an active project for month M:
 
 GOTCHA (verified): HubSpot's Accounts pipeline gives its "Procurement (Gain
 Approval)" stage the *internal id* `closedwon`. True Closed Won is the stage
-whose id is `1da62dec-16bb-491b-bd08-162539738ba4`. Filter by the Closed-Won
-stage id, NOT the string "closedwon", or you'll pull in-procurement deals that
-aren't confirmed revenue yet.
+whose id is `1da62dec-16bb-491b-bd08-162539738ba4`.
+
+BILLABLE stages (Erica, Aug 2026): a pal may tag a billable expense to a project
+that's confirmed OR still in "Procurement / Gain Approval" — engagements in that
+stage are already being delivered (pals incur billable travel for them), so Penny
+accepts BOTH stages as billable projects. `BILLABLE_STAGE_IDS` is the set to use
+for billable-tagging; `CLOSED_WON_STAGE_ID` alone is still the definition of
+CONFIRMED REVENUE (don't use the broader set where you mean confirmed revenue).
 
 Headless use needs a HubSpot private-app token (HUBSPOT_TOKEN) with crm.objects.
 deals.read. In Cowork the list is refreshed via the connected HubSpot MCP and
@@ -21,6 +26,11 @@ cached to clients/<client>/active_projects.yaml, which the DM builder reads.
 from __future__ import annotations
 
 CLOSED_WON_STAGE_ID = "1da62dec-16bb-491b-bd08-162539738ba4"
+# "Procurement / Gain Approval" (Accounts pipeline) — reports internal id
+# `closedwon` (the string), NOT true Closed Won.
+GAIN_APPROVAL_STAGE_ID = "closedwon"
+# Stages a billable expense may be tagged to (confirmed OR in gain-approval).
+BILLABLE_STAGE_IDS = (CLOSED_WON_STAGE_ID, GAIN_APPROVAL_STAGE_ID)
 
 # The query the recurring pull runs (SQL form used via the HubSpot connector):
 QUERY_TEMPLATE = (
@@ -35,7 +45,7 @@ def active_projects(rows: list, month_start: str, month_end: str) -> list:
     by deal id (a deal associated to two companies appears twice)."""
     seen, out = set(), []
     for r in rows:
-        if r.get("dealstage_id") != CLOSED_WON_STAGE_ID:
+        if r.get("dealstage_id") not in BILLABLE_STAGE_IDS:
             continue
         did = r.get("deal_id")
         if did in seen:

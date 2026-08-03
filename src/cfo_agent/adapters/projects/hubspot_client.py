@@ -8,14 +8,15 @@ back to the cached active-project list (today's behavior).
 from __future__ import annotations
 
 from ...config import env
-from .hubspot_projects import CLOSED_WON_STAGE_ID
+from .hubspot_projects import BILLABLE_STAGE_IDS
 
 _SEARCH = "https://api.hubapi.com/crm/v3/objects/deals/search"
 
 
 def search_closed_won(text: str, limit: int = 10) -> list:
-    """Closed-Won deals whose name matches `text`, as [{project, client}]. Empty
-    when there's no token, no query, or on any API error (never raises)."""
+    """Billable-stage deals (Closed Won OR Gain-Approval) whose name matches
+    `text`, as [{project, client}]. Empty when there's no token, no query, or on
+    any API error (never raises)."""
     token = env("HUBSPOT_TOKEN")
     if not token or not (text or "").strip():
         return []
@@ -24,8 +25,8 @@ def search_closed_won(text: str, limit: int = 10) -> list:
         "limit": max(1, min(limit, 50)),
         "properties": ["dealname", "dealstage"],
         "filterGroups": [{"filters": [
-            {"propertyName": "dealstage", "operator": "EQ",
-             "value": CLOSED_WON_STAGE_ID}]}],
+            {"propertyName": "dealstage", "operator": "IN",
+             "values": list(BILLABLE_STAGE_IDS)}]}],
     }
     try:
         import httpx

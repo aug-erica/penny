@@ -108,6 +108,36 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
             touched.add(c["external_id"])
             result["decisions"] += 1
 
+    # Positive collective fallback: the pal named a PROJECT but tied it to no
+    # specific charge ("both of these are to PPFA…"), answering Penny's "which
+    # project?" about the charges it just listed. Apply it to the ones awaiting a
+    # project when the interpreter caught nothing specific — mirrors the
+    # not-billable fallback above. Ambiguous project -> ask (project_unresolved).
+    result["project_unresolved"] = []
+    if not decided_billing:
+        awaiting_proj = [c for c in charges
+                         if (c.get("billable") == 1 and not c.get("project"))
+                         or (c.get("billable") is None
+                             and c.get("proposed_coa_line") in dm_assemble.BILLABLE_CANDIDATE)]
+        if awaiting_proj:
+            proj, proj_opts = project_lookup.resolve(cfg, month, text)
+            if proj:
+                for c in awaiting_proj:
+                    ledger.set_billable_project(conn, c["id"], 1, proj)
+                    ledger.record_decision(conn, cfg.client, month, c["external_id"],
+                                           "billable_project",
+                                           {"billable": 1, "project": proj},
+                                           decided_by=cardholder, source="slack")
+                    touched.add(c["external_id"])
+                    decided_billing.add(c["external_id"])
+                    result["decisions"] += 1
+                    if (c.get("external_id") or "").startswith("qbo-"):
+                        billable_push.append((c, proj))
+            elif proj_opts:
+                result["project_unresolved"].append(
+                    {"charges": [c["external_id"] for c in awaiting_proj],
+                     "options": proj_opts})
+
     # Enforce "billable ⇒ customer" (Natalie/Skyfin): push BillableStatus+Customer
     # to QBO now (not only when an invoice note arrives). If we can't confidently
     # match a client, DON'T write a customer-less billable — collect it so Penny
@@ -280,6 +310,13 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
             guess = (" — closest matches: " + ", ".join(u["candidates"][:3])) if u["candidates"] else ""
             qs.append(f"   • {merch} (you said \"{u['project']}\"){guess}")
         cb = cb + "\n" + "\n".join(qs)
+    # Named a project we couldn't pin to one deal (several close) — ask which.
+    if result.get("project_unresolved"):
+        opts = result["project_unresolved"][0].get("options", [])
+        qs = ["\n🧾 *Which project should I bill these to?* A few could fit — "
+              "reply with the exact name:"]
+        qs += [f"   • {o}" for o in opts[:5]]
+        cb = cb + "\n" + "\n".join(qs)
     # Pal asked for the full review workbook -> reply with the Drive link (single
     # source of truth; no file is sent, so no new Slack scope needed).
     result["workbook_link"] = 0
@@ -295,7 +332,8 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
             result["workbook_link"] = 1
 
     made = (result["decisions"] + result["recats"] + result["receipts"]
-            + result["clarify"] + result["workbook_link"] + result["notes"])
+            + result["clarify"] + result["workbook_link"] + result["notes"]
+            + len(result.get("project_unresolved", [])))
     if made == 0:
         # Be explicit when nothing was applied (reviewer feedback: "is she correcting?").
         cb = ("_(I didn't catch a specific change in that message, so I haven't recorded "
