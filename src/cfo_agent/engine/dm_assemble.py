@@ -17,7 +17,9 @@ TRIP_GAP_DAYS = 4          # a >4-day gap starts a new "trip"
 
 
 def _money(cents: int) -> str:
-    return f"${cents / 100:,.2f}"
+    if cents is not None and cents < 0:            # a deduction/offset reimbursement
+        return f"-${abs(cents) / 100:,.2f}"
+    return f"${(cents or 0) / 100:,.2f}"
 
 
 def _merchant(raw: str) -> str:

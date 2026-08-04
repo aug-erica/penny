@@ -297,12 +297,17 @@ def process_intake(conn, cfg, employee, uid, text, month,
     group_id = ext_base if len(slots) > 1 else None
     # File to the close of the month the expense was incurred, not the submit month.
     close_month = _close_month_for(expense_date, month)
+    # A negative/offset reimbursement (Levi reducing his payout): the receipt shows
+    # a positive magnitude, but the message carries the sign — apply it to each slot.
+    negative = ((parsed.get("amount_cents") or 0) < 0) or reimburse_parse.looks_negative(text)
 
     created, last_violations = [], []
     for i, g in enumerate(slots):
         cur = msg_currency or g.get("currency") or "USD"
-        pay_cents, orig_cur, orig_amt_cents, rate = _to_usd(
-            g.get("amount_cents"), cur, expense_date)
+        slot_amt = g.get("amount_cents")
+        if negative and slot_amt:
+            slot_amt = -abs(slot_amt)
+        pay_cents, orig_cur, orig_amt_cents, rate = _to_usd(slot_amt, cur, expense_date)
         ext = f"reimb-{ext_base}" if i == 0 else f"reimb-{ext_base}-{i + 1}"
         r = {
             "external_id": ext, "client": cfg.client,

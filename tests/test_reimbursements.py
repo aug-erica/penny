@@ -320,6 +320,28 @@ def test_cancel_withdraws_reimbursement(tmp_path):
                for e in ledger.reimbursement_events(conn, CLIENT, "reimb-CX"))
 
 
+def test_negative_reimbursement_keeps_the_sign(tmp_path, monkeypatch):
+    """Levi's offset: the receipt shows a positive magnitude but the message says
+    it's a deduction — the reimbursement is stored NEGATIVE so it reduces payout."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": -3021, "business_purpose": "offset personal purchase",
+        "expense_date": "2026-08-01", "proposed_coa_line": "Groceries & Meals",
+        "category_confidence": "high", "category_options": ["Groceries & Meals"]})
+    monkeypatch.setattr(reimburse_flow, "_ingest_receipt", lambda *a, **k: {
+        "receipt_status": "stored", "receipt_link": "d", "amount_cents": 3021,
+        "merchant": "Store", "currency": None})
+    res = reimburse_flow.process_intake(conn, cfg, "Levi Baer", "U02SCKJR170",
+                                        "reimburse -$30.21 to offset a personal purchase",
+                                        "2026-08", slack=_FakeSlack(), file_ids=["f"],
+                                        source_dm_ts="N1")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-N1")
+    assert row["amount_cents"] == -3021           # receipt magnitude, message sign
+    assert "-$30.21" in res["confirm_back"]
+
+
 def test_dont_cancel_is_not_a_cancel(tmp_path, monkeypatch):
     import cfo_agent.engine.reimburse_parse as rp
     monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {})

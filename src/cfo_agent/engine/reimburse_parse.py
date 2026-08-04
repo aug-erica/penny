@@ -21,8 +21,21 @@ from ..config import env
 
 MODEL = "claude-haiku-4-5-20251001"
 
-# Amounts with or without cents: $1,350 / $1,350.00 / 266.83 (same as reply_flow).
-_AMOUNT = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+(?:\.\d{2})?)")
+# Amounts with an optional leading minus: $1,350 / -$30.21 / $266.83. A negative
+# means a deduction/offset that REDUCES the payout (Levi's offset for a personal
+# purchase), so we keep the sign.
+_AMOUNT = re.compile(r"(-)?\s?\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+(?:\.\d{2})?)")
+# Words that mean "this REDUCES what I'm owed" even when the number is written
+# positive.
+_NEG_WORDS = re.compile(
+    r"\b(negative|offset|deduct|deduction|reduce|reduction|credit back|"
+    r"pay back|owe back|subtract)\b", re.I)
+
+
+def looks_negative(text: str) -> bool:
+    """True when the message signals a deduction (a '-' amount or an offset word)."""
+    t = text or ""
+    return bool(_NEG_WORDS.search(t)) or any(s for s, _ in _AMOUNT.findall(t))
 
 _PROMPT = """A team member at {client} is submitting a business expense to be REIMBURSED (they paid out of pocket and want the money back). Today is {today}.
 
@@ -33,7 +46,7 @@ Valid expense categories (use these VERBATIM — never invent one):
 {coa}
 
 Extract:
-- amount_usd: the dollar amount they paid (a number), or null if not stated.
+- amount_usd: the dollar amount (a number), or null if not stated. Use a NEGATIVE number if this is an offset/deduction/credit that REDUCES what they're owed (e.g. -30.21).
 - business_purpose: a concise one-line business purpose (what it was for / who it was with). null if they gave none.
 - expense_date: the date of the expense as YYYY-MM-DD. If they gave a date, use it (assume the current year if only month/day). If they gave none, use {today}.
 - category_options: the 1-3 MOST likely categories from the list, VERBATIM, best guess first. Always give at least one — infer from the purpose and merchant the way a bookkeeper would (e.g. a restaurant -> Groceries & Meals, a flight/hotel -> General Travel). Order by likelihood.
@@ -80,15 +93,27 @@ def interpret_reimbursement(client: str, text: str, coa_lines: list,
     except (ValueError, IndexError, json.JSONDecodeError):
         return {}
 
-    # Amount: trust the LLM only if it's an amount actually present in the text
-    # (guards against a hallucinated total); else fall back to the first typed
-    # amount; else None -> caller treats as needs_info.
-    text_cents = {round(float(a.replace(",", "")) * 100) for a in _AMOUNT.findall(text)}
+    # Amount: trust the LLM only if its MAGNITUDE is an amount actually present in
+    # the text (guards against a hallucinated total); the sign comes from the text
+    # ("-$30.21" / an offset word), not the LLM.
+    signed = []
+    for sign, num in _AMOUNT.findall(text):
+        c = round(float(num.replace(",", "")) * 100)
+        signed.append(-c if sign else c)
     amt = d.get("amount_usd")
-    amount_cents = round(amt * 100) if isinstance(amt, (int, float)) and amt else None
-    if amount_cents is None or (text_cents and amount_cents not in text_cents):
-        amount_cents = min(text_cents) if len(text_cents) == 1 else (
-            amount_cents if amount_cents else (next(iter(text_cents)) if text_cents else None))
+    llm_cents = round(amt * 100) if isinstance(amt, (int, float)) and amt else None
+    if signed:
+        by_mag = {abs(c): c for c in signed}
+        if llm_cents is not None and abs(llm_cents) in by_mag:
+            amount_cents = by_mag[abs(llm_cents)]       # magnitude matches -> keep typed sign
+        elif len(set(signed)) == 1:
+            amount_cents = signed[0]
+        else:
+            amount_cents = llm_cents if llm_cents is not None else signed[0]
+    else:
+        amount_cents = llm_cents
+    if amount_cents and _NEG_WORDS.search(text):        # explicit offset word wins
+        amount_cents = -abs(amount_cents)
 
     purpose = (d.get("business_purpose") or "").strip() or None
 
