@@ -66,6 +66,18 @@ class JustworksManual(PaymentRail):
                   "Use the exported CSV with Justworks' bulk upload."]
         return "\n".join(lines)
 
+    def csv_text(self, reimbursements: list, pay_date: str) -> str:
+        """The Justworks bulk-upload CSV as a string (header + one row each). This
+        is what the dashboard streams as a real download, and what re-download
+        regenerates — never depends on a file landing on disk."""
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(JW_HEADER)
+        for r in reimbursements:
+            w.writerow(self._row(r, pay_date))
+        return buf.getvalue()
+
     def _write_csv(self, reimbursements: list, ref: str, month: str, pay_date: str):
         """Write the Justworks bulk-upload CSV; upload to Drive if configured, else
         local. Returns the artifact link/path, or None on failure."""
@@ -73,10 +85,7 @@ class JustworksManual(PaymentRail):
         try:
             tmp = Path(tempfile.mktemp(suffix=".csv"))
             with tmp.open("w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(JW_HEADER)
-                for r in reimbursements:
-                    w.writerow(self._row(r, pay_date))
+                fh.write(self.csv_text(reimbursements, pay_date))
             name = f"justworks-reimbursements-{ref}.csv"
             if gdrive.configured():
                 link = gdrive.upload(tmp, name, month)
@@ -103,4 +112,5 @@ class JustworksManual(PaymentRail):
         artifact = self._write_csv(reimbursements, ref, month, pay_date)
         return {"rail": self.name, "ref": ref, "status": "exported",
                 "paste_text": self._paste_text(reimbursements, pay_date),
-                "artifact": artifact}
+                "artifact": artifact,
+                "csv_text": self.csv_text(reimbursements, pay_date)}

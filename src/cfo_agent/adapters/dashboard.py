@@ -12,6 +12,7 @@ import html
 import os
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from flask import Flask, Response, g, jsonify, request
 
@@ -395,8 +396,27 @@ def reimbursements_export():
     result = res["result"]
     return jsonify(ok=result.get("status") in ("exported", "paid"),
                    paste_text=result.get("paste_text", ""),
-                   artifact=result.get("artifact"), ref=result.get("ref"),
-                   count=len(res["reimbursements"]))
+                   csv_text=result.get("csv_text", ""),
+                   ref=result.get("ref"), count=len(res["reimbursements"]))
+
+
+@app.route("/reimbursements/export.csv", methods=["GET"])
+def reimbursements_export_csv():
+    """Re-download the Justworks CSV for the month's already-exported rows — so a
+    lost download (or a second batch's file) is always recoverable, without
+    re-running the export. `pay_date` optional (defaults to today)."""
+    from .payment import build_rail
+    conn = _db()
+    cfg = load_client(_client())
+    month = request.args.get("month") or _month()
+    pay_date = request.args.get("pay_date") or datetime.now(timezone.utc).strftime("%m/%d/%Y")
+    rows = ledger.reimbursements_for(conn, _client(), month, status="exported")
+    if not rows:
+        return Response(f"Nothing exported for {month} yet.", 404)
+    rail = build_rail(cfg)
+    csv_text = rail.csv_text(rows, pay_date)
+    return Response(csv_text, mimetype="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="justworks-{month}-exported.csv"'})
 
 
 @app.route("/reimbursements/mark-paid", methods=["POST"])
@@ -451,6 +471,7 @@ border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;disp
 <main>
 <div id="panel">
   <button id="export">Prepare Justworks payout ({n_appr} approved) →</button>
+  <button id="redownload">⬇︎ Re-download exported CSV ({n_exp})</button>
   <button id="markpaid">Mark exported as paid ({n_exp})</button>
   <span id="pstatus" class="mut"></span>
   <textarea id="paste" readonly placeholder="Copy-paste text for Justworks will appear here"></textarea>
@@ -484,10 +505,24 @@ document.getElementById('export').onclick=function(){{
   post('/reimbursements/export',{{pay_date:pd||null,month:month}}).then(function(j){{
     if(!j.ok){{document.getElementById('pstatus').textContent=j.error||'export failed';return;}}
     var ta=document.getElementById('paste'); ta.style.display='block'; ta.value=j.paste_text;
-    document.getElementById('pstatus').textContent='Exported '+j.count+' — download the CSV below for Justworks bulk upload.';
-    if(j.artifact)document.getElementById('artifact').innerHTML='📄 Justworks CSV: <a href="'+j.artifact+'">'+j.artifact+'</a>';
+    if(j.csv_text){{                       // real browser download — never a lost file
+      var blob=new Blob([j.csv_text],{{type:'text/csv'}});
+      var url=URL.createObjectURL(blob); var a=document.createElement('a');
+      a.href=url; a.download='justworks-'+(j.ref||'export')+'.csv';
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }}
+    document.getElementById('pstatus').textContent='Exported '+j.count+' — CSV downloaded to your computer for the Justworks bulk upload.';
+    document.getElementById('artifact').innerHTML='Need it again later? Use “Re-download exported CSV”.';
     ta.select();
   }});
+}};
+document.getElementById('redownload').onclick=function(){{
+  var month=document.getElementById('monthsel').value;
+  var pd=prompt('Justworks pay date for the file? (MM/DD/YYYY — blank = today)');
+  if(pd===null)return;
+  var u='/reimbursements/export.csv?month='+encodeURIComponent(month);
+  if(pd)u+='&pay_date='+encodeURIComponent(pd);
+  window.location=u;
 }};
 document.getElementById('markpaid').onclick=function(){{
   var month=document.getElementById('monthsel').value;
