@@ -8,6 +8,7 @@ only complete the second side of entries that already exist, so no duplicates.
 from __future__ import annotations
 
 import calendar
+import re
 from datetime import date
 
 import httpx
@@ -63,23 +64,56 @@ def customer_candidates(q, project: str, n: int = 3, customers=None) -> list:
     return scored[:n]
 
 
-def resolve_customer(q, project: str, customers=None):
-    """Project name -> QBO customer id, or None if no confident match. QBO
-    'customers' ARE the engagements (e.g. 'ACLU Privacy Governance'), so a pal's
-    project usually maps 1:1 — but names drift, so: exact, then substring, then a
-    strict fuzzy threshold; anything softer we leave for Penny to ask about."""
+def _split_fqn(c) -> tuple:
+    """A QBO customer's (parent, leaf) from its FullyQualifiedName 'Parent:Sub'.
+    Parents/top-level customers have no ':' so parent == leaf."""
+    fqn = (c.get("FullyQualifiedName") or c.get("DisplayName") or "").strip()
+    parts = [p.strip() for p in fqn.split(":") if p.strip()]
+    return (parts[0] if parts else fqn, parts[-1] if parts else fqn)
+
+
+def _client_token(project: str) -> str:
+    """The leading token of a project name — the client (PPFA, Gilead, Waymo,
+    McCain, Genentech…). Used to pin the QBO PARENT before matching the sub."""
+    toks = [t for t in re.split(r"[^A-Za-z0-9&]+", project or "") if t]
+    return toks[0].lower() if toks else ""
+
+
+def resolve_customer(q, project: str, customers=None, client=None):
+    """Project name -> QBO customer id, or None if no confident match. QBO is
+    parent (client) -> sub-customer (project); HubSpot deal names drift from the
+    QBO sub-customer names, so global fuzzy misses. Strategy: exact, then
+    containment, then PARENT-SCOPED fuzzy — pin the client parent, then match the
+    project only among THAT parent's sub-customers (Natalie: 'Genentech has 3-4
+    projects under it') — then a strict global fuzzy as a last resort."""
     if not project:
         return None
     custs = customers if customers is not None else all_customers(q)
     pl = project.lower().strip()
-    for c in custs:                                   # exact
-        if (c.get("DisplayName") or "").lower() == pl:
+    # 1. exact DisplayName or sub-customer leaf.
+    for c in custs:
+        if (c.get("DisplayName") or "").lower() == pl or _split_fqn(c)[1].lower() == pl:
             return c["Id"]
-    for c in custs:                                   # containment either way
+    # 2. containment either way (QBO sub is often the deal name minus the client prefix).
+    for c in custs:
         dn = (c.get("DisplayName") or "").lower()
         if dn and (dn in pl or pl in dn):
             return c["Id"]
-    cands = customer_candidates(q, project, 1, customers=custs)  # fuzzy
+    # 3. parent-scoped fuzzy: pin the parent (client), match the sub within it.
+    token = (client or "").lower().strip() or _client_token(project)
+    if token:
+        scoped = [(c, fuzz.token_set_ratio(pl, _split_fqn(c)[1].lower())) for c in custs
+                  if fuzz.partial_ratio(token, _split_fqn(c)[0].lower()) >= 90]
+        scoped.sort(key=lambda t: t[1], reverse=True)
+        # Parent is confirmed, so the absolute sub-score can be low; safety comes
+        # from a CLEAR winner (margin over the runner-up), so we never bill the
+        # wrong project within a client. Ambiguous ties fall through to be asked.
+        if scoped and scoped[0][1] >= 55:
+            runner = scoped[1][1] if len(scoped) > 1 else 0
+            if len(scoped) == 1 or scoped[0][1] - runner >= 12:
+                return scoped[0][0]["Id"]
+    # 4. strict global fuzzy (unchanged high bar) as a last resort.
+    cands = customer_candidates(q, project, 1, customers=custs)
     if cands and cands[0][2] >= CUSTOMER_MATCH_MIN:
         return cands[0][0]
     return None
