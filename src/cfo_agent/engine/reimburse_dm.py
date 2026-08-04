@@ -26,6 +26,16 @@ def _one_line(r: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
+def _close_label(cm: str) -> str:
+    """'2026-07' -> 'July 2026' for the confirm-back."""
+    import calendar
+    try:
+        y, m = cm.split("-")
+        return f"{calendar.month_name[int(m)]} {y}"
+    except Exception:
+        return cm or ""
+
+
 def ack_intake(first: str, r: dict, bot_name: str = "Penny") -> str:
     rc = ", receipt ✓" if r.get("receipt_status") == "stored" else ""
     cat = r.get("proposed_coa_line")
@@ -33,10 +43,12 @@ def ack_intake(first: str, r: dict, bot_name: str = "Penny") -> str:
     # employee never has to recall or type a category name up front.
     cat_note = (f" I filed it under *{cat}* — just reply if that's off. " if cat
                 else " ")
+    mo = _close_label(r.get("close_month"))
+    where = f"in the *{mo}* close queue" if mo else "in the approval queue"
     return (
         f"Got it, {first} — logged a reimbursement for {_one_line(r)}{rc}.{cat_note}"
-        f"It's in the approval queue now; I'll let you know once it's approved "
-        f"and set for payout. 🧾")
+        f"It's {where} now; I'll let you know once it's approved and set for "
+        f"payout. 🧾 _(Reply with the date if this should be a different month.)_")
 
 
 def category_options_block(options: list) -> str:
@@ -73,6 +85,12 @@ def project_options_block(options: list) -> str:
     for i, o in enumerate(options, 1):
         lines.append(f"   {i}) {o}")
     return "\n".join(lines)
+
+
+def cancelled(first: str, n: int = 1, bot_name: str = "Penny") -> str:
+    what = "that reimbursement" if n <= 1 else f"those {n} reimbursements"
+    return (f"Done, {first} — I've cancelled {what}; nothing will be paid out. "
+            f"Just start a new message if you want to re-file it. 👍")
 
 
 def clarify_intent(first: str) -> str:
@@ -184,7 +202,9 @@ def group_ack(first: str, rows: list, unreadable: int, need_client: bool,
     if need_client:
         body += "\n\n" + project_ask(first, rows[0])
     elif not unreadable:
-        body += "\n\nThey're in the approval queue now; I'll confirm once approved. 🧾"
+        mo = _close_label(rows[0].get("close_month"))
+        where = f"in the *{mo}* close queue" if mo else "in the approval queue"
+        body += f"\n\nThey're {where} now; I'll confirm once approved. 🧾"
     return body
 
 

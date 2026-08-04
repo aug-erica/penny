@@ -745,7 +745,7 @@ def set_reimbursement_status(conn, reimb_id: int, status: str, **fields):
 
 _REIMB_EDIT_FIELDS = frozenset({
     "amount_cents", "business_purpose", "proposed_coa_line", "expense_date",
-    "billable", "project", "orig_currency", "orig_amount_cents",
+    "billable", "project", "orig_currency", "orig_amount_cents", "close_month",
 })
 
 

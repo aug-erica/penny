@@ -49,6 +49,20 @@ def _load_pending(key: str, now_ts: str):
     return d
 
 
+def normalize_slack_text(text: str) -> str:
+    """Strip Slack mrkdwn so formatting never breaks Penny's parsing. A pal who
+    italicises their message sends '_reimburse $50_' — the leading '_' defeated the
+    trigger/keyword checks and Penny silently dropped it (Levi's bug). Unwrap
+    links/mentions to their labels and remove the *_~` wrappers."""
+    t = text or ""
+    t = re.sub(r"<([@#!][^>|]+)\|([^>]+)>", r"\2", t)   # <@U123|name>/<#C|name> -> name
+    t = re.sub(r"<[@#!][^>]+>", " ", t)                  # bare <@U123> mention -> space
+    t = re.sub(r"<([^>|]+)\|([^>]+)>", r"\2", t)          # <url|label> -> label
+    t = re.sub(r"<([^>]+)>", r"\1", t)                    # <url> -> url
+    t = re.sub(r"[*_~`]", "", t)                          # bold/italic/strike/code wrappers
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
 # Daily digest posts around this hour UTC (~9am ET). The scheduler checks a few
 # times an hour and posts once/day during the first week (guarded in the DB).
 _DIGEST_HOUR_UTC = 13
@@ -176,7 +190,9 @@ def run(client_name: str, month: str):
                 or (subtype and subtype != "file_share")):
             return
         uid = e.get("user")
-        text = e.get("text", "") or ""
+        # Normalize Slack formatting up front so italic/bold/code never breaks the
+        # trigger, intent, amount, or category parsing downstream.
+        text = normalize_slack_text(e.get("text", "") or "")
 
         # Admin month switch: "start the 2026-07 close" / "switch to July close".
         if uid in admins:

@@ -40,6 +40,28 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _close_month_for(expense_date: str, fallback: str) -> str:
+    """A reimbursement belongs to the close of the month it was INCURRED, not the
+    month it was submitted — so a July expense filed on Aug 3 lands in the July
+    close (Levi/Purvi's 'why is Penny putting this in August?'). Falls back to the
+    active month when the date is missing/garbled."""
+    m = re.match(r"(\d{4}-\d{2})-\d{2}$", expense_date or "")
+    return m.group(1) if m else fallback
+
+
+# Withdraw/cancel intent in a reimbursement thread.
+_CANCEL = re.compile(
+    r"\b(cancel|withdraw|nevermind|never mind|nvm|scratch that|disregard this|"
+    r"delete this|remove this|forget (this|it))\b", re.I)
+
+
+def _wants_cancel(text: str) -> bool:
+    t = (text or "").lower()
+    if "don't cancel" in t or "do not cancel" in t or "not cancel" in t:
+        return False
+    return bool(_CANCEL.search(t))
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")[:40]
 
@@ -273,6 +295,8 @@ def process_intake(conn, cfg, employee, uid, text, month,
                       "amount_cents": parsed.get("amount_cents"), "currency": None}]
     ext_base = source_dm_ts or uuid.uuid4().hex[:16]
     group_id = ext_base if len(slots) > 1 else None
+    # File to the close of the month the expense was incurred, not the submit month.
+    close_month = _close_month_for(expense_date, month)
 
     created, last_violations = [], []
     for i, g in enumerate(slots):
@@ -284,7 +308,7 @@ def process_intake(conn, cfg, employee, uid, text, month,
             "external_id": ext, "client": cfg.client,
             "entity": cfg.raw.get("entity") or "August", "employee": employee,
             "submitter_uid": uid, "kind": "one_off", "expense_date": expense_date,
-            "close_month": month, "amount_cents": pay_cents or 0, "currency": "USD",
+            "close_month": close_month, "amount_cents": pay_cents or 0, "currency": "USD",
             "business_purpose": purpose, "proposed_coa_line": coa,
             "billable": 1 if billable else 0, "project": project,
             "orig_currency": orig_cur, "orig_amount_cents": orig_amt_cents,
@@ -372,6 +396,25 @@ def process_followup(conn, cfg, employee, uid, text, month,
         return {"reimbursement": row, "status": row["status"],
                 "confirm_back": reimburse_dm.already(first, row)}
 
+    # Cancel / withdraw: a reply like "cancel" / "nevermind" / "scratch that" in the
+    # thread pulls the reimbursement (and its multi-receipt group) so it's never
+    # paid — Michael's "I tried to cancel… she doesn't get it".
+    if _wants_cancel(text) and not file_ids:
+        gid = row.get("group_id")
+        rows = (ledger.reimbursements_in_group(conn, cfg.client, gid) if gid else [row])
+        n = 0
+        for r in rows:
+            if r["status"] in ("submitted", "needs_info"):
+                ledger.set_reimbursement_status(conn, r["id"], "rejected",
+                                                rejected_reason="withdrawn by submitter")
+                ledger.record_reimbursement_event(conn, cfg.client, r["external_id"],
+                                                  "cancelled", {}, actor=employee,
+                                                  source="slack")
+                n += 1
+        fresh = ledger.reimbursement_by_id(conn, row["id"])
+        return {"reimbursement": fresh, "status": "rejected",
+                "confirm_back": reimburse_dm.cancelled(first, n)}
+
     rc = cfg.section("reimbursements")
 
     # A bare-number reply ("2", "#2") picks from the numbered category shortlist
@@ -434,7 +477,10 @@ def process_followup(conn, cfg, employee, uid, text, month,
     # Merge: new value wins if present, else keep what we already had (never null out).
     amount_cents = parsed.get("amount_cents") or receipt_amount or (row.get("amount_cents") or None)
     purpose = parsed.get("business_purpose") or row.get("business_purpose")
-    expense_date = row.get("expense_date") or _today()
+    # Honor a corrected date in the reply ("actually it was July 15") and move the
+    # reimbursement to that month's close if it changed.
+    expense_date = parsed.get("expense_date") or row.get("expense_date") or _today()
+    new_close_month = _close_month_for(expense_date, row.get("close_month"))
 
     # Category: a follow-up only changes it when it adds real signal — the row had
     # none yet, or the reply clearly names/confirms one (high confidence). This stops
@@ -449,7 +495,7 @@ def process_followup(conn, cfg, employee, uid, text, month,
 
     ledger.update_reimbursement_fields(
         conn, row["id"], amount_cents=amount_cents, business_purpose=purpose,
-        proposed_coa_line=coa, expense_date=expense_date,
+        proposed_coa_line=coa, expense_date=expense_date, close_month=new_close_month,
         orig_currency=fu_orig_cur, orig_amount_cents=fu_orig_amt)
     if receipt_status == "stored" and row.get("receipt_status") != "stored":
         ledger.set_reimbursement_receipt(conn, row["id"], "stored", receipt_link)

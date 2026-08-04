@@ -290,6 +290,48 @@ def test_multi_receipt_group_currency_and_client_propagation(monkeypatch, tmp_pa
     assert all(r["status"] == "submitted" for r in grp)
 
 
+def test_filed_to_expense_month_not_submit_month(tmp_path, monkeypatch):
+    """A July expense filed in August lands in the JULY close (Levi/Purvi bug)."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 4200, "business_purpose": "July team lunch",
+        "expense_date": "2026-07-15", "proposed_coa_line": "Groceries & Meals",
+        "category_confidence": "high", "category_options": ["Groceries & Meals"]})
+    res = reimburse_flow.process_intake(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                        "reimburse $42 July lunch", "2026-08",
+                                        source_dm_ts="M1")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-M1")
+    assert row["close_month"] == "2026-07"        # not the submit month (2026-08)
+    assert "july" in res["confirm_back"].lower()
+
+
+def test_cancel_withdraws_reimbursement(tmp_path):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    rid = _reimb(conn, employee="Keara Mascareñas", ext="reimb-CX", status="submitted")
+    res = reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                          "actually cancel this", "2026-07", thread_ts="CX")
+    assert res["status"] == "rejected"
+    assert "cancel" in res["confirm_back"].lower()
+    assert ledger.reimbursement_by_id(conn, rid)["status"] == "rejected"
+    assert any(e["event"] == "cancelled"
+               for e in ledger.reimbursement_events(conn, CLIENT, "reimb-CX"))
+
+
+def test_dont_cancel_is_not_a_cancel(tmp_path, monkeypatch):
+    import cfo_agent.engine.reimburse_parse as rp
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {})
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    _reimb(conn, employee="Keara Mascareñas", ext="reimb-NC", status="submitted")
+    res = reimburse_flow.process_followup(conn, cfg, "Keara Mascareñas", "UPDU3SRN0",
+                                          "please don't cancel this one", "2026-07",
+                                          thread_ts="NC")
+    assert res["status"] != "rejected"
+
+
 def test_receipt_required_only_at_threshold():
     from cfo_agent.engine.reimburse_flow import _missing_fields
     rc = load_client(CLIENT).section("reimbursements")   # threshold 10000 ($100)
