@@ -119,6 +119,82 @@ def resolve_customer(q, project: str, customers=None, client=None):
     return None
 
 
+def proj_norm(s: str) -> str:
+    """Normalized project key for the qbo_customer_map cache."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def resolve_parent(q, client: str, customers=None, aliases=None):
+    """The QBO PARENT (top-level) customer for a client. Applies an alias map so a
+    HubSpot acronym maps to the QBO legal name (PPFA -> Planned Parenthood Federation
+    of America). Returns (id, display_name) or (None, None)."""
+    if not client:
+        return None, None
+    custs = customers if customers is not None else all_customers(q)
+    al = {k.lower(): v for k, v in (aliases or {}).items()}
+    name = al.get(client.lower(), client)
+    nl = name.lower().strip()
+    parents = [c for c in custs
+               if ":" not in (c.get("FullyQualifiedName") or c.get("DisplayName") or "")]
+    for c in parents:                                   # exact / containment
+        dn = (c.get("DisplayName") or "").lower()
+        if dn and (dn == nl or nl in dn or dn in nl):
+            return c["Id"], c.get("DisplayName")
+    best, score = None, 0                                # fuzzy
+    for c in parents:
+        s = fuzz.token_set_ratio(nl, (c.get("DisplayName") or "").lower())
+        if s > score:
+            best, score = c, s
+    return (best["Id"], best.get("DisplayName")) if best and score >= 88 else (None, None)
+
+
+def _children_of(parent_name: str, customers: list) -> list:
+    pl = (parent_name or "").lower()
+    return [c for c in customers
+            if (c.get("FullyQualifiedName") or "").lower().startswith(pl + ":")]
+
+
+def create_customer(q, display_name: str, parent_id=None) -> dict:
+    """Create a QBO customer (a sub-customer/Job when parent_id is given). Returns
+    the created Customer object (with its Id)."""
+    body = {"DisplayName": display_name}
+    if parent_id:
+        body["Job"] = True
+        body["ParentRef"] = {"value": str(parent_id)}
+    if not q._access_token:
+        q._refresh_access_token()
+    url = f"{q.base}/v3/company/{q.realm_id}/customer?minorversion={MINOR_VERSION}"
+    resp = httpx.post(url, headers={"Authorization": f"Bearer {q._access_token}",
+                                    "Accept": "application/json",
+                                    "Content-Type": "application/json"},
+                      json=body, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"QBO create Customer failed: HTTP {resp.status_code} "
+                           f"{resp.text[:400]}")
+    return resp.json().get("Customer", resp.json())
+
+
+def ensure_subcustomer(q, parent_id: str, parent_name: str, project: str,
+                       customers: list, create: bool = False):
+    """Find the sub-customer for `project` under the given parent (fuzzy on the sub
+    name), or create it when `create=True`. Returns (customer_id, action) where
+    action is 'matched' | 'created' | 'missing'."""
+    subs = _children_of(parent_name, customers)
+    pl = project.lower().strip()
+    for c in subs:                                       # exact leaf / containment
+        leaf = _split_fqn(c)[1].lower()
+        if leaf == pl or (leaf and (leaf in pl or pl in leaf)):
+            return c["Id"], "matched"
+    scored = sorted(((c, fuzz.token_set_ratio(pl, _split_fqn(c)[1].lower())) for c in subs),
+                    key=lambda t: t[1], reverse=True)
+    if scored and scored[0][1] >= 80:
+        return scored[0][0]["Id"], "matched"
+    if create and parent_id:
+        c = create_customer(q, project, parent_id=parent_id)
+        return c.get("Id"), "created"
+    return None, "missing"
+
+
 # ---- receipt attachment ----------------------------------------------------
 _MAGIC = [
     (b"%PDF", "application/pdf", ".pdf"),

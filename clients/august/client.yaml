@@ -134,6 +134,15 @@ billable:
   # adapters/projects/hubspot_projects.py. Headless refresh needs HUBSPOT_TOKEN.
   billable_projects_file: "active_projects.yaml"
 
+# Billable-customer resolution to QuickBooks. QBO is parent (client) -> sub-customer
+# (project). HubSpot names drift from QBO, and clients are sometimes an acronym in
+# HubSpot but the legal name in QBO — map those here so Penny pins the right PARENT
+# before matching/creating the sub-customer. (Add entries as they come up.)
+qbo:
+  parent_aliases:
+    PPFA: "Planned Parenthood Federation of America"
+    ACLU: "American Civil Liberties Union"
+
 # Employee out-of-pocket REIMBURSEMENTS (moving off Expensify). A pal just DMs
 # Penny about an expense they paid for ("$42 client lunch" + a receipt) — the
 # "reimburse" trigger word is OPTIONAL now: because Penny initiates all card-charge

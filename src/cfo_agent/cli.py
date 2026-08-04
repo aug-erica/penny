@@ -733,6 +733,78 @@ def cmd_qbo_smoke(args):
     return 0
 
 
+def cmd_qbo_customers(args):
+    """Connect this month's BILLABLE charges to their QuickBooks customer.
+
+    For each billable charge with a project: use the cached map, else parent-scoped
+    match, else pin the parent (with aliases) and match/CREATE the sub-customer.
+    Default is a DRY RUN (reports the plan, no writes). --apply provisions missing
+    sub-customers, tags the QBO purchases, and persists the map. Run with
+    DATABASE_URL set (Penny's DATABASE_PUBLIC_URL) so it hits the live ledger + kv.
+    """
+    from .adapters.books_out import qbo_writer
+    from .adapters.card_feed.qbo_feed import QBOFeed
+    from .engine.reply_flow import _rewrite_qbo_billable
+    cfg = load_client(args.client)
+    conn = _db(cfg)
+    apply = bool(args.apply)
+    aliases = (cfg.raw.get("qbo", {}) or {}).get("parent_aliases", {}) or {}
+    lines = [l for l in ledger.lines_for_month(conn, cfg.client, args.month)
+             if l.get("billable") == 1 and l.get("project")
+             and l["status"] != "excluded" and l["amount_cents"] > 0]
+    print(f"{'APPLY' if apply else 'DRY RUN'} — {len(lines)} billable charge(s) with a "
+          f"project for {args.month}\n")
+    if not lines:
+        return 0
+    from collections import defaultdict
+    q = QBOFeed(); q._refresh_access_token()
+    custs = qbo_writer.all_customers(q)
+    cached = ledger.qbo_customer_map(conn, cfg.client)
+    byid = {c["Id"]: (c.get("FullyQualifiedName") or c.get("DisplayName")) for c in custs}
+    stats = defaultdict(int)
+    groups = defaultdict(list)                       # resolve ONCE per project
+    for l in lines:
+        groups[l["project"]].append(l)
+    for project, glines in groups.items():
+        pn = qbo_writer.proj_norm(project)
+        cid = cached.get(pn) or qbo_writer.resolve_customer(q, project, customers=custs)
+        action = "cached" if cached.get(pn) else ("matched" if cid else None)
+        if not cid:
+            pid, pname = qbo_writer.resolve_parent(
+                q, project.split()[0], customers=custs, aliases=aliases)
+            if not pid:
+                action = "no-parent"
+            elif apply:
+                cid, action = qbo_writer.ensure_subcustomer(q, pid, pname, project, custs, create=True)
+            else:
+                cid, act = qbo_writer.ensure_subcustomer(q, pid, pname, project, custs, create=False)
+                action = act if cid else "would_create"
+                if action == "would_create":
+                    print(f"  ✎ would create sub-customer '{project}' under '{pname}'")
+        name = byid.get(cid) or (project if action in ("created", "would_create") else "?")
+        if cid and apply and action != "cached":
+            ledger.upsert_qbo_customer(conn, cfg.client, pn, cid, qbo_name=name, source=action)
+        tagged = 0
+        if cid and apply:
+            for l in glines:
+                if (l.get("external_id") or "").startswith("qbo-"):
+                    try:
+                        _rewrite_qbo_billable(cfg, l["external_id"], project, customer=cid, q=q)
+                        tagged += 1
+                    except Exception as e:
+                        print(f"    [tag FAILED {l['external_id']}: {e}]")
+        stats[action] += len(glines)
+        stats["tagged"] += tagged
+        flag = {"cached": "✓", "matched": "✓", "created": "＋", "would_create": "✎"}.get(action, "✗")
+        tot = sum(l["amount_cents"] for l in glines) / 100
+        print(f"  {flag} ${tot:>9,.2f}  {len(glines)} charge(s)  {project[:44]:<44} -> {name}"
+              + (f"  [tagged {tagged}]" if tagged else ""))
+    print("\nsummary:", dict(stats))
+    if not apply:
+        print("\n(dry run — re-run with --apply to create sub-customers + tag QBO)")
+    return 0
+
+
 def cmd_db_smoke(args):
     """Prove the ledger backend: connect, ensure schema, round-trip a write.
     On Railway (DATABASE_URL set) this confirms Postgres; locally, SQLite."""
@@ -1005,6 +1077,12 @@ def main(argv=None):
     qsub = qbo.add_subparsers(dest="subcmd", required=True)
     qs = qsub.add_parser("smoke")
     qs.set_defaults(fn=cmd_qbo_smoke)
+    qc = qsub.add_parser("customers", help="connect billable charges to QBO customers")
+    qc.add_argument("--client", default="august")
+    qc.add_argument("--month", required=True, help="close month YYYY-MM")
+    qc.add_argument("--apply", action="store_true",
+                    help="provision missing sub-customers + tag QBO (default: dry run)")
+    qc.set_defaults(fn=cmd_qbo_customers)
 
     penny = sub.add_parser("penny")
     psub = penny.add_subparsers(dest="subcmd", required=True)

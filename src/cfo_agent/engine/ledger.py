@@ -79,6 +79,20 @@ CREATE TABLE IF NOT EXISTS merchant_rules (
   updated_at    TEXT NOT NULL,
   PRIMARY KEY (client, merchant_norm)
 );
+-- Durable HubSpot-project -> QBO-customer map: once a billable project resolves
+-- (or a sub-customer is provisioned) we cache the QBO customer id here, keyed by
+-- the normalized project name (+ the HubSpot deal id when known), so drifting
+-- names never cost us the mapping again.
+CREATE TABLE IF NOT EXISTS qbo_customer_map (
+  client          TEXT NOT NULL,
+  project_norm    TEXT NOT NULL,
+  hubspot_deal_id TEXT,
+  qbo_customer_id TEXT NOT NULL,
+  qbo_name        TEXT,
+  source          TEXT,
+  updated_at      TEXT NOT NULL,
+  PRIMARY KEY (client, project_norm)
+);
 -- Append-only journal of HUMAN decisions (pal replies, dashboard edits,
 -- approvals). Agent proposals are rebuildable and live on ledger_lines, while
 -- human decisions are durable and REPLAY on top after any close re-run
@@ -237,6 +251,30 @@ def learned_rules(conn, client: str) -> dict:
         "SELECT merchant_norm, coa_line FROM merchant_rules WHERE client=?", (client,))}
 
 
+def upsert_qbo_customer(conn, client: str, project_norm: str, qbo_customer_id: str,
+                        qbo_name: str = None, hubspot_deal_id: str = None,
+                        source: str = "auto"):
+    """Cache a HubSpot-project -> QBO-customer mapping. Latest wins. Idempotent."""
+    if not project_norm or not qbo_customer_id:
+        return
+    conn.execute(
+        "INSERT INTO qbo_customer_map(client, project_norm, hubspot_deal_id, "
+        "qbo_customer_id, qbo_name, source, updated_at) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(client, project_norm) DO UPDATE SET "
+        "qbo_customer_id=excluded.qbo_customer_id, qbo_name=excluded.qbo_name, "
+        "hubspot_deal_id=COALESCE(excluded.hubspot_deal_id, qbo_customer_map.hubspot_deal_id), "
+        "source=excluded.source, updated_at=excluded.updated_at",
+        (client, project_norm, hubspot_deal_id, qbo_customer_id, qbo_name, source, now()))
+    conn.commit()
+
+
+def qbo_customer_map(conn, client: str) -> dict:
+    """{project_norm: qbo_customer_id} — the cached project->customer mappings."""
+    return {r["project_norm"]: r["qbo_customer_id"] for r in conn.execute(
+        "SELECT project_norm, qbo_customer_id FROM qbo_customer_map WHERE client=?",
+        (client,))}
+
+
 def digest_posted(conn, client: str, close_month: str, post_date: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM digest_posts WHERE client=? AND close_month=? AND post_date=?",
@@ -274,10 +312,29 @@ def _ensure_reimb_columns(conn):
                     pass  # already present
         except Exception:
             pass
+    # Tables added after the reimbursements cutover won't exist on the live DB
+    # (the fast path skips base DDL) — create them here. CREATE TABLE IF NOT EXISTS
+    # is idempotent and takes no contended lock.
     try:
+        conn.executescript(_EXTRA_TABLES)
         conn.commit()
     except Exception:
         pass
+
+
+# Tables introduced after the reimbursements migration cutover.
+_EXTRA_TABLES = """
+CREATE TABLE IF NOT EXISTS qbo_customer_map (
+  client          TEXT NOT NULL,
+  project_norm    TEXT NOT NULL,
+  hubspot_deal_id TEXT,
+  qbo_customer_id TEXT NOT NULL,
+  qbo_name        TEXT,
+  source          TEXT,
+  updated_at      TEXT NOT NULL,
+  PRIMARY KEY (client, project_norm)
+);
+"""
 
 
 def open_db(path) -> db.Conn:

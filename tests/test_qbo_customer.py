@@ -44,3 +44,46 @@ def test_explicit_client_hint_pins_parent():
     # When we DO know the client (e.g. from HubSpot's associated company), pass it.
     assert w.resolve_customer(None, "OOP FY27 Advisory", customers=CUSTS,
                               client="PPFA") == "1"
+
+
+# --- parent resolution + sub-customer provisioning (solutions ②③) -----------
+PPFA_CUSTS = [
+    {"Id": "P", "DisplayName": "Planned Parenthood Federation of America",
+     "FullyQualifiedName": "Planned Parenthood Federation of America"},
+    {"Id": "S1", "DisplayName": "OOP Org Design and Change Management",
+     "FullyQualifiedName": "Planned Parenthood Federation of America:OOP Org Design and Change Management"},
+]
+ALIASES = {"PPFA": "Planned Parenthood Federation of America"}
+
+
+def test_resolve_parent_uses_alias():
+    # HubSpot acronym "PPFA" -> QBO legal-name parent.
+    assert w.resolve_parent(None, "PPFA", customers=PPFA_CUSTS, aliases=ALIASES)[0] == "P"
+
+
+def test_ensure_subcustomer_missing_without_create():
+    # The FY27 engagement isn't in QBO yet and create=False -> missing.
+    cid, action = w.ensure_subcustomer(
+        None, "P", "Planned Parenthood Federation of America",
+        "OOP FY27 Advisory, Design and Facilitation", PPFA_CUSTS, create=False)
+    assert cid is None and action == "missing"
+
+
+def test_ensure_subcustomer_creates_when_allowed(monkeypatch):
+    monkeypatch.setattr(w, "create_customer", lambda q, name, parent_id=None: {"Id": "NEW"})
+    cid, action = w.ensure_subcustomer(
+        None, "P", "Planned Parenthood Federation of America",
+        "OOP FY27 Advisory, Design and Facilitation", PPFA_CUSTS, create=True)
+    assert cid == "NEW" and action == "created"
+
+
+def test_ensure_subcustomer_matches_existing():
+    cid, action = w.ensure_subcustomer(
+        None, "P", "Planned Parenthood Federation of America",
+        "OOP Org Design and Change Management", PPFA_CUSTS, create=False)
+    assert cid == "S1" and action == "matched"
+
+
+def test_proj_norm():
+    assert w.proj_norm("PPFA OOP FY27 Advisory, Design & Facilitation") == \
+        "ppfa oop fy27 advisory design facilitation"
