@@ -183,6 +183,15 @@ reimbursements:
     "Erica Seldin": {work_email: "erica@aug.co", member_id: "member_019x65xyh85gab0gkfys615apb"}
     "Purvi Patel": {work_email: "purvi@aug.co", member_id: "member_01k83xmm2fz7n3rwy4ytcw2m8f"}
     "Keara Mascareñas": {work_email: "keara@aug.co", member_id: "member_01ehdcjx0ge98jj7c9w91zn1p3"}
+    "Mike Arauz": {work_email: "mike@aug.co"}
+    "Alexis Black": {work_email: "alexis@aug.co"}
+    "Samantha Lozzi": {work_email: "sam@aug.co"}
+    "Levi Baer": {work_email: "levi@aug.co"}
+    "Michael Burkin": {work_email: "michaelb@aug.co"}
+    "Tirzah Enumah": {work_email: "tirzah@aug.co"}
+    "Karina Mangu-Ward": {work_email: "karina@aug.co"}
+    "Jessie Punia": {work_email: "jessie@aug.co"}
+    "Melissa Shamis": {work_email: "melissa@aug.co"}
   payment:
     type: "justworks_manual"            # manual for v1: Penny prepares, a human pays in Justworks
   # QBO booking (Natalie/Skyfin, final structure July 2026): on APPROVAL Penny
