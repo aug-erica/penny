@@ -54,7 +54,8 @@ def normalize_slack_text(text: str) -> str:
     italicises their message sends '_reimburse $50_' — the leading '_' defeated the
     trigger/keyword checks and Penny silently dropped it (Levi's bug). Unwrap
     links/mentions to their labels and remove the *_~` wrappers."""
-    t = text or ""
+    import html
+    t = html.unescape(text or "")                        # &amp;->&  &lt;-><  &gt;->>
     t = re.sub(r"<([@#!][^>|]+)\|([^>]+)>", r"\2", t)   # <@U123|name>/<#C|name> -> name
     t = re.sub(r"<[@#!][^>]+>", " ", t)                  # bare <@U123> mention -> space
     t = re.sub(r"<([^>|]+)\|([^>]+)>", r"\2", t)          # <url|label> -> label

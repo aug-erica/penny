@@ -15,6 +15,12 @@ def test_unwraps_links_and_mentions():
     assert n("see <https://x.com>") == "see https://x.com"
 
 
+def test_unescapes_html_entities():
+    # Slack sends & as &amp; — unescape so category names like "Telephone & Internet" match.
+    assert n("reimburse $50 home internet &amp; phone") == \
+        "reimburse $50 home internet & phone"
+
+
 def test_plain_text_untouched():
     assert n("reimburse $42 for lunch with the McCain team") == \
         "reimburse $42 for lunch with the McCain team"
