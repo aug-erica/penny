@@ -305,9 +305,22 @@ def process_intake(conn, cfg, employee, uid, text, month,
     for i, g in enumerate(slots):
         cur = msg_currency or g.get("currency") or "USD"
         slot_amt = g.get("amount_cents")
+        # PARTIAL claim: with a single receipt, if the pal stated an amount, honor
+        # THAT (what they're claiming) over the receipt's total — e.g. "$50" of a
+        # $90 receipt (Levi getting reimbursed for only a portion of a charge).
+        receipt_amt = g.get("amount_cents")
+        partial_note = None
+        if (len(slots) == 1 and parsed.get("amount_cents") is not None):
+            slot_amt = parsed.get("amount_cents")
+            if receipt_amt and abs(slot_amt) != receipt_amt:   # claiming only a portion
+                partial_note = (f"partial claim: ${abs(slot_amt) / 100:.2f} of a "
+                                f"${receipt_amt / 100:.2f} receipt")
         if negative and slot_amt:
             slot_amt = -abs(slot_amt)
         pay_cents, orig_cur, orig_amt_cents, rate = _to_usd(slot_amt, cur, expense_date)
+        rationale = _fx_rationale(cat_conf, coa, orig_cur, orig_amt_cents, rate)
+        if partial_note:
+            rationale = (rationale + "; " if rationale else "") + partial_note
         ext = f"reimb-{ext_base}" if i == 0 else f"reimb-{ext_base}-{i + 1}"
         r = {
             "external_id": ext, "client": cfg.client,
@@ -318,7 +331,7 @@ def process_intake(conn, cfg, employee, uid, text, month,
             "billable": 1 if billable else 0, "project": project,
             "orig_currency": orig_cur, "orig_amount_cents": orig_amt_cents,
             "group_id": group_id,
-            "rationale": _fx_rationale(cat_conf, coa, orig_cur, orig_amt_cents, rate),
+            "rationale": rationale,
             "receipt_status": g.get("receipt_status"), "receipt_link": g.get("receipt_link"),
             "status": "submitted", "source_dm_ts": source_dm_ts,
         }

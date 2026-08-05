@@ -342,6 +342,47 @@ def test_negative_reimbursement_keeps_the_sign(tmp_path, monkeypatch):
     assert "-$30.21" in res["confirm_back"]
 
 
+def test_partial_claim_honors_stated_amount_over_receipt(tmp_path, monkeypatch):
+    """Levi's case: receipt reads $90 but he only claims $50 — reimburse the stated
+    $50 (a portion), not the receipt total, and note the discrepancy for review."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": 5000, "business_purpose": "home internet", "expense_date": "2026-08-01",
+        "proposed_coa_line": "Telephone & Internet", "category_confidence": "high",
+        "category_options": ["Telephone & Internet"]})
+    monkeypatch.setattr(reimburse_flow, "_ingest_receipt", lambda *a, **k: {
+        "receipt_status": "stored", "receipt_link": "d", "amount_cents": 9000,
+        "merchant": "Verizon", "currency": None})
+    res = reimburse_flow.process_intake(conn, cfg, "Levi Baer", "U02SCKJR170",
+                                        "reimburse $50 for home internet", "2026-08",
+                                        slack=_FakeSlack(), file_ids=["f"], source_dm_ts="P1")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-P1")
+    assert row["amount_cents"] == 5000            # claimed $50, not the $90 receipt
+    assert "partial claim" in (row.get("rationale") or "")
+    assert res["status"] == "submitted"
+
+
+def test_full_receipt_amount_used_when_no_stated_amount(tmp_path, monkeypatch):
+    """No amount stated -> the receipt total stands (normal case, unchanged)."""
+    import cfo_agent.engine.reimburse_parse as rp
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {
+        "amount_cents": None, "business_purpose": "dinner", "expense_date": "2026-08-01",
+        "proposed_coa_line": "Groceries & Meals", "category_confidence": "high",
+        "category_options": ["Groceries & Meals"]})
+    monkeypatch.setattr(reimburse_flow, "_ingest_receipt", lambda *a, **k: {
+        "receipt_status": "stored", "receipt_link": "d", "amount_cents": 4200,
+        "merchant": "X", "currency": None})
+    reimburse_flow.process_intake(conn, cfg, "Levi Baer", "U02SCKJR170",
+                                  "here's a dinner receipt", "2026-08",
+                                  slack=_FakeSlack(), file_ids=["f"], source_dm_ts="P2")
+    row = ledger.reimbursement_by_external_id(conn, CLIENT, "reimb-P2")
+    assert row["amount_cents"] == 4200 and "partial" not in (row.get("rationale") or "")
+
+
 def test_dont_cancel_is_not_a_cancel(tmp_path, monkeypatch):
     import cfo_agent.engine.reimburse_parse as rp
     monkeypatch.setattr(rp, "interpret_reimbursement", lambda *a, **k: {})
