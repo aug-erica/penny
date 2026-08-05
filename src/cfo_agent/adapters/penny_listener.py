@@ -413,11 +413,20 @@ def run(client_name: str, month: str):
             import datetime as _dt
             while True:
                 try:
-                    cur_month = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m")
+                    now = _dt.datetime.now(_dt.timezone.utc)
+                    cur_month = now.strftime("%Y-%m")
+                    py, pm = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+                    prev_month = f"{py:04d}-{pm:02d}"
                     conn = ledger.open_db(db_path)
-                    res = cc_mod.run_once(conn, cfg, penny, cur_month, post=True, log=_log)
-                    if res.get("new"):
-                        _log(f"[continuous] {res['new']} new charge(s) booked + DM'd: {res.get('pals')}")
+                    # Sweep the CURRENT and PREVIOUS month: a charge that posts to
+                    # Credit Card Pending in the last days of a month (or lands after
+                    # the month rolls over) would otherwise never be fetched by the
+                    # new month's poll — that's how the July 29–31 charges got stranded.
+                    for mo in (cur_month, prev_month):
+                        res = cc_mod.run_once(conn, cfg, penny, mo, post=True, log=_log)
+                        if res.get("new"):
+                            _log(f"[continuous] {mo}: {res['new']} new charge(s) "
+                                 f"booked + DM'd: {res.get('pals')}")
                 except Exception:
                     _log(f"[continuous] error: {traceback.format_exc()}")
                 time.sleep(interval)
