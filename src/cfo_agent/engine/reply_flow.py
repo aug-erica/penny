@@ -74,6 +74,7 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
 
     # 1. billable / project
     billable_push = []   # (line, project) marked billable this reply on a qbo-* line
+    unbill_push = []     # qbo-* external_ids set NOT billable this reply -> clear in QBO
     decided_billing = set()   # external_ids the interpreter made a billing call on
     for d in reply_parse.interpret_reply(cfg.client, text, charges, projects):
         line = by_ext.get(d["external_id"])
@@ -89,6 +90,8 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
             result["decisions"] += 1
             if b == 1 and d.get("project") and (line.get("external_id") or "").startswith("qbo-"):
                 billable_push.append((line, d["project"]))
+            elif b == 0 and (line.get("external_id") or "").startswith("qbo-"):
+                unbill_push.append(line["external_id"])
 
     # Fallback: a bare "not billable" that names no charge applies to the charges
     # Penny is awaiting a billing call on — the billable-candidate charges still
@@ -107,6 +110,8 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                                    decided_by=cardholder, source="slack")
             touched.add(c["external_id"])
             result["decisions"] += 1
+            if (c.get("external_id") or "").startswith("qbo-"):
+                unbill_push.append(c["external_id"])
 
     # Positive collective fallback: the pal named a PROJECT but tied it to no
     # specific charge ("both of these are to PPFA…"), answering Penny's "which
@@ -204,6 +209,13 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                 _rewrite_qbo(cfg, line["external_id"], coa)
             except Exception:
                 pass
+    # Not-billable this reply: clear the stale Billable flag + customer in QBO so the
+    # charge drops off the client/T&E report (best-effort — never break the reply).
+    for ext in dict.fromkeys(unbill_push):
+        try:
+            _unbill_qbo(cfg, ext)
+        except Exception:
+            pass
 
     # 3. receipts — download + store; link to a charge by amount when possible
     result["filed"] = []          # (merchant, amount_cents) linked this reply
@@ -396,6 +408,24 @@ def _rewrite_qbo_billable(cfg, external_id: str, project: str, note: str = None,
         op["billable_customer"] = customer
     qbo_writer.commit_one(q, op)
     return customer
+
+
+def _unbill_qbo(cfg, external_id: str, coa: str = None, q=None):
+    """Clear a charge's Billable flag + customer on the booked QBO charge (qbo-<id>)
+    when the pal says it's not billable. Without this the 'not billable' reply
+    updates the ledger + category but leaves a STALE BillableStatus/CustomerRef in
+    QBO, so the charge keeps showing on the client/T&E report (the drift Natalie
+    flagged). Optionally also sets the natural category `coa`; otherwise keeps it."""
+    from ..adapters.books_out import qbo_writer
+    from ..adapters.card_feed.qbo_feed import QBOFeed
+    pid = external_id.split("qbo-", 1)[1]
+    if q is None:
+        q = QBOFeed(realm_id=""); q._refresh_access_token()
+    p = q.query(f"SELECT * FROM Purchase WHERE Id = '{pid}'")
+    if not p:
+        return
+    gl = qbo_writer.load_mapping(cfg.client).get(coa) if coa else None
+    qbo_writer.commit_one(q, {"purchase": p[0], "gl_id": gl, "unbill": True})
 
 
 def _attach_receipt_qbo(cfg, external_id: str, file_path, line: dict):

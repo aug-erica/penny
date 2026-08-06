@@ -485,6 +485,11 @@ def commit_one(q, op) -> dict:
             if op.get("billable_customer"):
                 nd["BillableStatus"] = "Billable"
                 nd["CustomerRef"] = {"value": op["billable_customer"]}
+            elif op.get("unbill"):
+                # Charge is no longer billable to a client: clear the flag + customer
+                # so it drops off the billable/T&E report (mirrors setting billable).
+                nd["BillableStatus"] = "NotBillable"
+                nd.pop("CustomerRef", None)
             nl = dict(ln); nl["AccountBasedExpenseLineDetail"] = nd
             if op.get("note"):                        # invoice description for billables
                 base = (ln.get("Description") or "").strip()
