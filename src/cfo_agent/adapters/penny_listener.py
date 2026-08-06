@@ -23,7 +23,6 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 
 from ..config import RUNS_LOCAL, env, load_client
 from ..engine import continuous_close as cc_mod
-from ..engine import digest as digest_mod
 from ..engine import (intent, kv, ledger, penny_catchup, receipts, reimburse_dm,
                       reimburse_flow, reply_flow)
 from .slack_client import PennySlack
@@ -63,10 +62,6 @@ def normalize_slack_text(text: str) -> str:
     t = re.sub(r"[*_~`]", "", t)                          # bold/italic/strike/code wrappers
     return re.sub(r"[ \t]{2,}", " ", t).strip()
 
-
-# Daily digest posts around this hour UTC (~9am ET). The scheduler checks a few
-# times an hour and posts once/day during the first week (guarded in the DB).
-_DIGEST_HOUR_UTC = 13
 
 # Admin command: "start the 2026-07 close" / "switch to July close". Kept tight
 # (must end with the word "close") so a normal expense reply is never hijacked.
@@ -386,21 +381,12 @@ def run(client_name: str, month: str):
     except Exception:
         _log(f"[error] catch-up on startup: {traceback.format_exc()}")
 
-    # Daily #finance digest — a background thread posts it once/day during the
-    # first week (idempotent via the DB guard, so restarts never double-post).
-    def digest_loop():
-        import datetime as _dt
-        while True:
-            try:
-                if _dt.datetime.now(_dt.timezone.utc).hour >= _DIGEST_HOUR_UTC:
-                    conn = ledger.open_db(db_path)
-                    if digest_mod.post_if_due(conn, cfg, active_month(), penny) == "posted":
-                        _log("[digest] posted daily digest to #finance")
-            except Exception:
-                _log(f"[digest] error: {traceback.format_exc()}")
-            time.sleep(1800)   # re-check every 30 min
-
-    threading.Thread(target=digest_loop, daemon=True).start()
+    # The daily #finance digest thread was removed (Aug 2026). It keyed off the
+    # current calendar month, so once the close month rolled over it reported an
+    # empty in-flight month — a green all-clear while the prior close was still
+    # open. The digest itself still exists and is now on-demand only:
+    #   cfo-agent notify digest --client august --month 2026-07 --post
+    # Per-pal DMs (notify send) are unaffected.
 
     # Continuous close: poll QBO for newly-posted charges (enrolled cardholders),
     # categorize + book + DM them as they happen — a steady drip, not a month-end
