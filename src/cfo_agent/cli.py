@@ -790,6 +790,10 @@ def cmd_qbo_customers(args):
                 if (l.get("external_id") or "").startswith("qbo-"):
                     try:
                         _rewrite_qbo_billable(cfg, l["external_id"], project, customer=cid, q=q)
+                        # billable to a client -> Billable Expense GL (Natalie's rule);
+                        # keep the ledger in step with the QBO write.
+                        ledger.set_proposal(conn, l["id"], "Billable Expense", "reviewer",
+                                            "high", "billable to client -> Billable Expense")
                         tagged += 1
                     except Exception as e:
                         print(f"    [tag FAILED {l['external_id']}: {e}]")

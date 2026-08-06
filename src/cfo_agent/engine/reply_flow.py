@@ -159,6 +159,11 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                     _rewrite_qbo_billable(cfg, line["external_id"], project, customer=cust, q=q)
                 except Exception:
                     pass
+                # Keep the ledger/dashboard in step with QBO: a charge billable to a
+                # client moves to Billable Expense (Natalie's rule). Deliberately NOT
+                # a flywheel rule — billability is per-charge, not a merchant fact.
+                ledger.set_proposal(conn, line["id"], "Billable Expense", "reviewer",
+                                    "high", "billable to client -> Billable Expense")
             else:
                 cands = qbo_writer.customer_candidates(q, project, 3, customers=custs) if q else []
                 result["customer_unresolved"].append(
@@ -361,10 +366,14 @@ def _rewrite_qbo(cfg, external_id: str, coa: str):
 def _rewrite_qbo_billable(cfg, external_id: str, project: str, note: str = None,
                           customer=None, q=None):
     """Push a billable expense's client + optional invoice note to the booked QBO
-    charge, keeping its existing category — so it carries onto the client invoice,
-    the way Expensify did. Only marks the line Billable when a customer is known
-    (commit_one skips BillableStatus when billable_customer is falsy), so we never
-    write a customer-less billable. Returns the resolved customer id (or None)."""
+    charge. When a customer is known, the charge is billable to a client, so it
+    moves to the *Billable Expense* GL account (Natalie's rule: every client-billable
+    expense must sit in Billable Expense so the T&E invoice reads cleanly — not its
+    natural category like General Travel or Friday Lunch). Only marks the line
+    Billable when a customer is known (commit_one skips BillableStatus when
+    billable_customer is falsy), so we never write a customer-less billable, and a
+    charge with no matched customer keeps its existing category untouched. Returns
+    the resolved customer id (or None)."""
     from ..adapters.books_out import qbo_writer
     from ..adapters.card_feed.qbo_feed import QBOFeed
     pid = external_id.split("qbo-", 1)[1]
@@ -374,12 +383,15 @@ def _rewrite_qbo_billable(cfg, external_id: str, project: str, note: str = None,
     if not p:
         return None
     p = p[0]
-    # keep the category already on the expense line
     cur_gl = next((ln["AccountBasedExpenseLineDetail"]["AccountRef"]["value"]
                    for ln in p["Line"] if ln.get("AccountBasedExpenseLineDetail")), None)
     if customer is None:                       # robust, paginated, fuzzy resolver
         customer = qbo_writer.resolve_customer(q, project)
-    op = {"purchase": p, "gl_id": cur_gl, "note": note}
+    # Billable to a client -> Billable Expense GL; otherwise keep the category.
+    target_gl = cur_gl
+    if customer:
+        target_gl = qbo_writer.load_mapping(cfg.client).get("Billable Expense") or cur_gl
+    op = {"purchase": p, "gl_id": target_gl, "note": note}
     if customer:
         op["billable_customer"] = customer
     qbo_writer.commit_one(q, op)
