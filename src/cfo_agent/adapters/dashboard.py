@@ -394,9 +394,29 @@ def reimbursements_export():
     res = reimburse_flow.export_payout(conn, cfg, [r["id"] for r in approved],
                                        build_rail(cfg), pay_date=pay_date)
     result = res["result"]
+    qbo = res.get("qbo") or {}
+    # A human-readable QBO booking summary so a booking failure is NEVER invisible.
+    if qbo.get("error"):
+        qbo_msg = f"⚠ QBO booking failed: {qbo['error']}"
+    elif qbo:
+        parts = [f"{len(qbo.get('booked', []))} Bill(s) booked",
+                 f"{qbo.get('receipts_attached', 0)} receipt(s) attached"]
+        pays = qbo.get("payments") or {}
+        if pays.get("paid_bills"):
+            parts.append(f"{len(pays['paid_bills'])} Bill(s) paid → clearing")
+        if pays.get("already_paid"):
+            parts.append(f"{len(pays['already_paid'])} Bill(s) already paid")
+        if qbo.get("problems"):
+            parts.append(f"⚠ {len(qbo['problems'])} flag(s): " + "; ".join(qbo["problems"][:4]))
+        if pays.get("errors"):
+            parts.append("⚠ payment errors: " + "; ".join(pays["errors"][:3]))
+        qbo_msg = " · ".join(parts)
+    else:
+        qbo_msg = ""       # QBO not enabled in this environment
     return jsonify(ok=result.get("status") in ("exported", "paid"),
                    paste_text=result.get("paste_text", ""),
                    csv_text=result.get("csv_text", ""),
+                   qbo_msg=qbo_msg,
                    ref=result.get("ref"), count=len(res["reimbursements"]))
 
 
@@ -512,7 +532,9 @@ document.getElementById('export').onclick=function(){{
       document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     }}
     document.getElementById('pstatus').textContent='Exported '+j.count+' — CSV downloaded to your computer for the Justworks bulk upload.';
-    document.getElementById('artifact').innerHTML='Need it again later? Use “Re-download exported CSV”.';
+    var art='Need it again later? Use “Re-download exported CSV”.';
+    if(j.qbo_msg){{art+=' QuickBooks: '+j.qbo_msg;}}
+    document.getElementById('artifact').textContent=art;
     ta.select();
   }});
 }};

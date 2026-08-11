@@ -645,6 +645,17 @@ def reject(conn, cfg, reimb_id: int, reason: str, actor: str, slack=None) -> dic
     return fresh
 
 
+def _payment_date(pay_date: str = None) -> str:
+    """QBO-formatted date matching the Justworks pay date."""
+    if pay_date:
+        for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(pay_date, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    return _today()
+
+
 def export_payout(conn, cfg, reimb_ids, rail, pay_date: str = None) -> dict:
     """Run the payment rail over the given APPROVED reimbursements and mark them
     exported. `pay_date` is the payout date for rails that need one. Returns
@@ -654,15 +665,28 @@ def export_payout(conn, cfg, reimb_ids, rail, pay_date: str = None) -> dict:
     if not rows:
         return {"result": {"status": "failed", "paste_text": "", "artifact": None,
                            "ref": None, "rail": getattr(rail, "name", "")},
-                "reimbursements": []}
+                "reimbursements": [], "qbo": None}
     # Book the month's grouped QBO Bills now (one per employee, dated month-end) —
-    # best-effort, cloud-only. Done before marking exported so the rows are still
-    # eligible; idempotent so a re-export never double-bills.
+    # cloud-only. Done before marking exported so the rows are still eligible;
+    # idempotent so a re-export never double-bills. A QBO failure must NEVER be
+    # swallowed silently (that hid the whole pipeline being down for the July
+    # close) or block the Justworks payout — capture it, journal it per row, and
+    # return a summary the dashboard surfaces.
+    qbo = None
     if _qbo_enabled(cfg):
         try:
-            book_month(conn, cfg, rows[0]["close_month"], post=True)
-        except Exception:
-            pass
+            book = book_month(conn, cfg, rows[0]["close_month"], post=True,
+                              reimb_ids=[r["id"] for r in rows])
+            qbo = {"booked": [b for b in book["bills"] if b.get("bill_id")],
+                   "problems": [p for b in book["bills"] for p in b.get("problems", [])],
+                   "receipts_attached": sum(b.get("receipts_attached", 0)
+                                            for b in book["bills"])}
+        except Exception as ex:
+            qbo = {"error": str(ex)[:300], "booked": [], "problems": [], "receipts_attached": 0}
+            for r in rows:
+                ledger.record_reimbursement_event(
+                    conn, cfg.client, r["external_id"], "qbo_bill_error",
+                    {"stage": "export", "error": str(ex)[:300]}, actor="system", source="qbo")
     result = rail.pay_batch(rows, pay_date=pay_date)
     if result.get("status") in ("exported", "paid"):
         new_status = "paid" if result["status"] == "paid" else "exported"
@@ -674,7 +698,30 @@ def export_payout(conn, cfg, reimb_ids, rail, pay_date: str = None) -> dict:
                 conn, cfg.client, r["external_id"], new_status,
                 {"payout_ref": result.get("ref"), "artifact": result.get("artifact")},
                 actor="system", source="rail")
-    return {"result": result,
+    # Natalie's ask: the Export button (payout to Justworks) triggers the QBO
+    # BillPayment that clears each Bill against 1345 Employee Reimbursement Clearing.
+    # Pay each grouped Bill once (balance-0 guarded — no double-pay); best-effort.
+    if _qbo_enabled(cfg) and result.get("status") in ("exported", "paid"):
+        fresh = [ledger.reimbursement_by_id(conn, r["id"]) for r in rows]
+        bill_ids = {r.get("qbo_bill_id") for r in fresh if r.get("qbo_bill_id")}
+        paid_bills, already_paid, pay_errors = [], [], []
+        for bid in bill_ids:
+            try:
+                res = _pay_bill(conn, cfg, bid, post=True,
+                                txn_date=_payment_date(pay_date))
+                if not res.get("ok"):
+                    pay_errors.append(f"bill {bid}: Bill not found or clearing account missing")
+                    continue
+                if res.get("already_paid"):
+                    already_paid.append(bid)
+                    continue
+                paid_bills.append(bid)
+            except Exception as ex:
+                pay_errors.append(f"bill {bid}: {str(ex)[:200]}")
+        qbo = (qbo or {})
+        qbo["payments"] = {"paid_bills": paid_bills, "already_paid": already_paid,
+                           "errors": pay_errors}
+    return {"result": result, "qbo": qbo,
             "reimbursements": [ledger.reimbursement_by_id(conn, r["id"]) for r in rows]}
 
 
@@ -814,52 +861,141 @@ def pay_bill_reimbursement(conn, cfg, reimb_id: int, post: bool = False) -> dict
     return out
 
 
-def book_month(conn, cfg, month: str, post: bool = False, bill_date: str = None) -> dict:
+def _resolve_reimb_customer(conn, q, cfg, project, customers):
+    """QBO customer id for a billable reimbursement's project, or None. Reuses the
+    card-side drift-proof matcher (parent-scoped fuzzy), applying the client
+    parent_aliases so a HubSpot acronym (PPFA) pins the QBO legal-name parent."""
+    if not project:
+        return None
+    from ..adapters.books_out import qbo_writer
+    project_norm = qbo_writer.proj_norm(project)
+    cached = ledger.qbo_customer_map(conn, cfg.client).get(project_norm)
+    customer_ids = {str(c.get("Id")) for c in customers}
+    if cached and str(cached) in customer_ids:
+        return cached
+    aliases = {k.lower(): v for k, v in
+               (cfg.raw.get("qbo", {}).get("parent_aliases") or {}).items()}
+    token = qbo_writer._client_token(project)
+    client_hint = aliases.get(token)          # full QBO parent name when aliased, else None
+    customer_id = qbo_writer.resolve_customer(
+        q, project, customers=customers, client=client_hint)
+    if customer_id:
+        match = next((c for c in customers if str(c.get("Id")) == str(customer_id)), {})
+        ledger.upsert_qbo_customer(
+            conn, cfg.client, project_norm, customer_id,
+            qbo_name=match.get("FullyQualifiedName") or match.get("DisplayName"),
+            source="reimbursement_match")
+    return customer_id
+
+
+def _attach_bill_receipt(q, cfg, bill_id, row) -> bool:
+    """Download a reimbursement's stored Drive receipt and attach it to its QBO
+    Bill (so the receipt shows on the Bill, mirroring the card side). Best-effort —
+    returns True only on a clean attach."""
+    from ..adapters.books_out import qbo_writer
+    from . import gdrive
+    if row.get("receipt_status") != "stored" or not gdrive.configured():
+        return False
+    fid = gdrive.file_id_from_link(row.get("receipt_link"))
+    if not fid:
+        return False
+    tmp = Path(tempfile.mktemp())
+    try:
+        gdrive.download(fid, tmp)
+        fname = (f"{(row.get('employee') or 'emp').split()[0]}-"
+                 f"{_slug(row.get('business_purpose') or 'receipt')}-"
+                 f"{(row.get('amount_cents') or 0) / 100:.2f}")
+        qbo_writer.attach_receipt(q, bill_id, tmp, filename=fname, entity_type="Bill")
+        return True
+    except Exception:
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def book_month(conn, cfg, month: str, post: bool = False, bill_date: str = None,
+               reimb_ids=None) -> dict:
     """Group a month's reimbursements into ONE QBO Bill per employee (Natalie's
     structure): a multi-line Bill (one line per reimbursement on its category GL),
     payable to normal A/P, dated the last day of the month (override via bill_date).
-    Only bills reimbursements that are approved/exported and not yet on a Bill, so
-    re-running never duplicates. Dry-run (post=False) returns the plan without any
-    QBO calls; post=True creates the Bills and stamps qbo_bill_id on each line's row."""
+    A billable line (billable flag or a billable category, with a project) is marked
+    Billable to its resolved QBO customer so it flows to the client invoice; each
+    line's stored receipt is attached to the Bill. Only bills reimbursements that
+    are approved/exported and not yet on a Bill, so re-running never duplicates.
+    Dry-run (post=False) returns the plan without any QBO calls; post=True creates
+    the Bills, resolves customers, attaches receipts, and stamps qbo_bill_id."""
     from ..adapters.books_out import qbo_writer
     from ..adapters.card_feed.qbo_feed import QBOFeed
     qc = cfg.section("reimbursements").get("qbo", {}) or {}
     ap_id = qc.get("ap_account_id")
     vendors = qc.get("vendors", {}) or {}
     mapping = qbo_writer.load_mapping(cfg.client)
+    billable_cats = set(cfg.section("billable").get("billable_categories") or [])
     txn_date = bill_date or _month_end(month)
 
+    # Book anything approved/exported/paid that has no Bill yet. Including 'paid'
+    # is what lets us BACKFILL reimbursements that were exported+paid before the
+    # QBO pipeline worked (the whole July close) — the no-qbo_bill_id guard keeps
+    # it idempotent, so a normal run never re-bills a row that already has a Bill.
+    selected = {int(i) for i in reimb_ids} if reimb_ids is not None else None
     eligible = [r for r in ledger.reimbursements_for(conn, cfg.client, month)
-                if r["status"] in ("approved", "exported") and not r.get("qbo_bill_id")]
+                if r["status"] in ("approved", "exported", "paid")
+                and not r.get("qbo_bill_id")
+                and (selected is None or r["id"] in selected)]
     by_emp = defaultdict(list)
     for r in eligible:
         by_emp[r["employee"]].append(r)
 
-    q = None
+    q, customers = None, None
     bills = []
     for emp, rows in sorted(by_emp.items()):
         vend_name = vendors.get(emp)
         lines, problems = [], []
         for r in rows:
-            gl = mapping.get(r.get("proposed_coa_line"))
-            if not r.get("proposed_coa_line") or not gl:
+            coa = r.get("proposed_coa_line")
+            gl = mapping.get(coa)
+            if not coa or not gl:
                 problems.append(f"#{r['id']} has no mapped category — skipped")
                 continue
+            # Billable when the row is flagged billable OR sits in a billable
+            # category — and only actionable as billable if we know the project.
+            wants_billable = bool(r.get("billable") == 1 or coa in billable_cats)
             lines.append({"gl_id": gl, "amount_cents": r["amount_cents"],
                           "description": r.get("business_purpose") or "Reimbursement",
-                          "reimb_id": r["id"], "ext": r["external_id"]})
+                          "reimb_id": r["id"], "ext": r["external_id"],
+                          "wants_billable": wants_billable, "project": r.get("project"),
+                          "receipt_status": r.get("receipt_status"),
+                          "receipt_link": r.get("receipt_link"), "row": r})
         if not vend_name:
             problems.append(f"no QBO vendor mapped for {emp}")
+        # Flag billable lines we can't yet bill to a client (no project captured).
+        unresolved = [l for l in lines if l["wants_billable"] and not l["project"]]
+        for l in unresolved:
+            problems.append(f"#{l['reimb_id']} is billable but has no client/project — "
+                            f"booked to its category without a customer (reviewer to set)")
         item = {"employee": emp, "vendor_name": vend_name, "txn_date": txn_date,
                 "n_lines": len(lines), "total_cents": sum(l["amount_cents"] for l in lines),
-                "problems": problems}
+                "n_billable": sum(1 for l in lines if l["wants_billable"] and l["project"]),
+                "receipts_attached": 0, "problems": problems}
         if post and lines and vend_name:
             if q is None:
                 q = QBOFeed(realm_id=""); q._refresh_access_token()
+                customers = qbo_writer.all_customers(q)
             vendor_id = qbo_writer.resolve_vendor_by_name(q, vend_name)
             if not vendor_id:
                 item["problems"].append(f"QBO vendor '{vend_name}' not found")
             else:
+                # Resolve the QBO customer for each billable line (best-effort; an
+                # unresolved one still books to its category, just not Billable).
+                for l in lines:
+                    if l["wants_billable"] and l["project"]:
+                        cid = _resolve_reimb_customer(conn, q, cfg, l["project"], customers)
+                        if cid:
+                            l["customer_id"] = cid
+                        else:
+                            item["problems"].append(
+                                f"#{l['reimb_id']} billable to '{l['project']}' but no "
+                                f"matching QBO customer — booked without a customer")
                 bill = qbo_writer.create_bill_lines(
                     q, vendor_id, lines, txn_date,
                     memo=f"{emp} reimbursements — {month}", ap_account_id=ap_id)
@@ -871,14 +1007,21 @@ def book_month(conn, cfg, month: str, post: bool = False, bill_date: str = None)
                                                     qbo_vendor_id=vendor_id, qbo_bill_id=bid)
                     ledger.record_reimbursement_event(
                         conn, cfg.client, l["ext"], "qbo_bill",
-                        {"bill_id": bid, "grouped": True, "txn_date": txn_date},
+                        {"bill_id": bid, "grouped": True, "txn_date": txn_date,
+                         "customer_id": l.get("customer_id")},
                         actor="system", source="qbo")
+                    if _attach_bill_receipt(q, cfg, bid, l["row"]):
+                        item["receipts_attached"] += 1
+                    elif l["receipt_status"] == "stored":
+                        item["problems"].append(
+                            f"#{l['reimb_id']} receipt could not be attached to QBO Bill {bid}")
         bills.append(item)
     return {"month": month, "txn_date": txn_date, "bills": bills,
             "n_employees": len(bills)}
 
 
-def _pay_bill(conn, cfg, bill_id: str, post: bool = True) -> dict:
+def _pay_bill(conn, cfg, bill_id: str, post: bool = True,
+              txn_date: str = None) -> dict:
     """Pay a (possibly grouped) Bill in full, crediting 1345 — one BillPayment per
     Bill. Skips if the Bill is already at $0 balance (no double-payment)."""
     from ..adapters.books_out import qbo_writer
@@ -899,7 +1042,7 @@ def _pay_bill(conn, cfg, bill_id: str, post: bool = True) -> dict:
     if not post:
         return {"ok": True, "would_pay_cents": round(bal * 100)}
     bp = qbo_writer.create_bill_payment(q, bill_id, vendor_id, round(bal * 100),
-                                        ledger.now()[:10], clearing, ap_id)
+                                        txn_date or ledger.now()[:10], clearing, ap_id)
     return {"ok": True, "billpayment_id": bp.get("Id")}
 
 

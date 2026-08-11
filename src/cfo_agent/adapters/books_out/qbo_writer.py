@@ -219,10 +219,12 @@ def _sniff(path) -> tuple:
     return "application/pdf", ".pdf"
 
 
-def attach_receipt(q, purchase_id: str, file_path, filename: str = "") -> str:
-    """Attach a receipt file to a QBO Purchase via the /upload (Attachable)
-    endpoint, so it shows right on the expense — no manual matching. Returns the
-    new Attachable Id."""
+def attach_receipt(q, purchase_id: str, file_path, filename: str = "",
+                   entity_type: str = "Purchase") -> str:
+    """Attach a receipt file to a QBO transaction via the /upload (Attachable)
+    endpoint, so it shows right on the expense — no manual matching. `entity_type`
+    is the QBO entity the file links to: "Purchase" for a card charge, "Bill" for
+    an employee reimbursement Bill. Returns the new Attachable Id."""
     import json as _json
 
     import re as _re
@@ -235,7 +237,7 @@ def attach_receipt(q, purchase_id: str, file_path, filename: str = "") -> str:
     base = (base or f"receipt-{purchase_id}")[:80]
     filename = base if base.lower().endswith(ext) else base + ext
     metadata = {
-        "AttachableRef": [{"EntityRef": {"type": "Purchase", "value": str(purchase_id)},
+        "AttachableRef": [{"EntityRef": {"type": entity_type, "value": str(purchase_id)},
                            "IncludeOnSend": False}],
         "FileName": filename,
         "ContentType": ct,
@@ -397,14 +399,21 @@ def create_bill(q, vendor_id, gl_id, amount_cents, txn_date, memo=None,
 
 
 def bill_body_lines(vendor_id, lines, txn_date, memo=None, ap_account_id=None) -> dict:
-    """A multi-line Bill body. `lines` = [{gl_id, amount_cents, description}] — one
-    expense line per reimbursement, each on its own category GL. Used to group an
-    employee's month of reimbursements into a single Bill."""
+    """A multi-line Bill body. `lines` = [{gl_id, amount_cents, description,
+    customer_id?}] — one expense line per reimbursement, each on its own category
+    GL. When a line carries a `customer_id` (a billable reimbursement whose client
+    resolved), the line is marked Billable to that customer so it flows to the
+    client invoice — same as a billable card charge. Used to group an employee's
+    month of reimbursements into a single Bill."""
     body_lines = []
     for l in lines:
+        detail = {"AccountRef": {"value": str(l["gl_id"])}}
+        if l.get("customer_id"):
+            detail["BillableStatus"] = "Billable"
+            detail["CustomerRef"] = {"value": str(l["customer_id"])}
         bl = {"DetailType": "AccountBasedExpenseLineDetail",
               "Amount": round(l["amount_cents"] / 100.0, 2),
-              "AccountBasedExpenseLineDetail": {"AccountRef": {"value": str(l["gl_id"])}}}
+              "AccountBasedExpenseLineDetail": detail}
         desc = (l.get("description") or "").strip()
         if desc:
             bl["Description"] = desc[:1000]

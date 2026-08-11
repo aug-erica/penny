@@ -63,3 +63,39 @@ def upload(local_path, name: str, month: str) -> str:
                            media_body=media, fields="id, webViewLink",
                            supportsAllDrives=True).execute()
     return f.get("webViewLink") or f"drive:{f['id']}"
+
+
+def file_id_from_link(link: str):
+    """Pull the Drive file id out of a stored receipt_link. Handles the two shapes
+    store_file returns — a webViewLink ('.../file/d/<id>/view...') and our
+    'drive:<id>' fallback — plus a bare id. Returns None for a local filesystem
+    path (a link that isn't a Drive reference)."""
+    import re
+    s = (link or "").strip()
+    if not s:
+        return None
+    if s.startswith("drive:"):
+        return s.split("drive:", 1)[1] or None
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", s)          # /file/d/<id>/view
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", s)       # ...?id=<id>
+    if m:
+        return m.group(1)
+    if "/" not in s and re.fullmatch(r"[A-Za-z0-9_-]{20,}", s):  # bare id
+        return s
+    return None
+
+
+def download(file_id: str, dest) -> bool:
+    """Download a Drive file by id to `dest`. Returns True on success. Used to pull
+    a stored receipt back out of the Brain so it can be attached to a QBO Bill."""
+    from googleapiclient.http import MediaIoBaseDownload
+    svc = _service()
+    req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
+    with open(dest, "wb") as fh:
+        dl = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _status, done = dl.next_chunk()
+    return True

@@ -657,14 +657,34 @@ def cmd_reimburse_book_month(args):
     print(f"Grouped Bills for {res['month']} (dated {res['txn_date']}):")
     for b in res["bills"]:
         tag = f"  [QBO Bill {b['bill_id']}]" if b.get("bill_id") else ""
-        print(f"  {b['employee']}: {b['n_lines']} line(s), "
+        bills = f", {b['n_billable']} billable" if b.get("n_billable") else ""
+        rec = f", {b['receipts_attached']} receipt(s)" if b.get("receipts_attached") else ""
+        print(f"  {b['employee']}: {b['n_lines']} line(s){bills}{rec}, "
               f"${b['total_cents']/100:.2f} -> vendor {b.get('vendor_name')}{tag}")
         for p in b.get("problems", []):
             print(f"     ⚠ {p}")
     if not res["bills"]:
         print("  (nothing eligible to bill)")
+    # Backfill helper: also clear each just-created Bill against 1345 (for
+    # reimbursements that were already paid before the QBO pipeline worked).
+    if args.post and args.pay:
+        pay_date = reimburse_flow._payment_date(args.pay_date or res["txn_date"])
+        print(f"\nPaying Bills on {pay_date} "
+              "(credit 1345 Employee Reimbursement Clearing):")
+        for b in res["bills"]:
+            bid = b.get("bill_id")
+            if not bid:
+                continue
+            try:
+                pr = reimburse_flow._pay_bill(
+                    conn, cfg, bid, post=True, txn_date=pay_date)
+                state = "already paid" if pr.get("already_paid") else \
+                    f"paid (BillPayment {pr.get('billpayment_id')})"
+                print(f"  Bill {bid} ({b['employee']}): {state}")
+            except Exception as ex:
+                print(f"  Bill {bid} ({b['employee']}): ⚠ pay failed — {str(ex)[:200]}")
     if not args.post:
-        print("\n(dry-run — add --post to create the Bills in QBO)")
+        print("\n(dry-run — add --post to create the Bills in QBO, --pay to also clear them)")
     return 0
 
 
@@ -1053,7 +1073,12 @@ def main(argv=None):
     rbm.add_argument("--client", required=True)
     rbm.add_argument("--month", required=True)
     rbm.add_argument("--date", default=None, help="Bill date (default: last day of the month)")
+    rbm.add_argument("--pay-date", dest="pay_date", default=None,
+                     help="Bill Payment date (YYYY-MM-DD or MM/DD/YYYY; default: Bill date)")
     rbm.add_argument("--post", action="store_true", help="create the Bills in QBO (else dry-run)")
+    rbm.add_argument("--pay", action="store_true",
+                     help="also create the BillPayment (credit 1345) for each Bill — "
+                          "for backfilling already-paid reimbursements")
     rbm.set_defaults(fn=cmd_reimburse_book_month)
     rpb = rsub.add_parser("post-bill", help="[legacy/single] create/preview a QBO Bill for one reimbursement")
     rpb.add_argument("--client", required=True)

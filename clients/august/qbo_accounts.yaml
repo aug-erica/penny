@@ -23,6 +23,14 @@ expense_accounts:
     qbo_id: '150'
     qbo_name: Groceries & Meals
     gl_num: '8532'
+  Marketing - Book:
+    qbo_id: '1150040005'
+    qbo_name: 'Sales:Marketing:Book Marketing'
+    gl_num: '8519'
+  Marketing - General:
+    qbo_id: '344'
+    qbo_name: 'Sales:Marketing:Marketing'
+    gl_num: '8517'
   Moving & Relocation:
     qbo_id: '132'
     qbo_name: Moving & Relocation
@@ -55,6 +63,10 @@ expense_accounts:
     qbo_id: '142'
     qbo_name: Client Engagement & Lead Development
     gl_num: '8513'
+  Sales Subscriptions:
+    qbo_id: '316'
+    qbo_name: 'Sales:Subscriptions & Memberships'
+    gl_num: '8514'
   Sales System Improvements and Coaching (GBAS):
     qbo_id: '317'
     qbo_name: Sales System Improvements and Coaching (GBAS)

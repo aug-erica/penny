@@ -197,14 +197,13 @@ reimbursements:
   # QBO booking (Natalie/Skyfin, final structure July 2026): on APPROVAL Penny
   # creates a Bill (vendor = employee) with the expense line coded to the ACTUAL
   # category GL and the normal A/P as payable  -> DR category / CR A/P (proper P&L
-  # categorization). When the Bill is marked paid, the offset goes to 1345 Employee
-  # Reimbursement Clearing (Other Current Asset), NOT a bank -> DR A/P / CR 1345.
+  # categorization). When Purvi exports the Justworks batch, Penny pays the Bill
+  # from the 1345 Employee Reimbursement Clearing credit-card account
+  # -> DR A/P / CR 1345.
   # Justworks also posts the reimbursement to 1345, so the two offset and 1345 nets
   # to ~zero (no double-count). employee -> exact QBO Vendor DisplayName (varies;
-  # do not fuzzy). NOTE: a QBO Bill Payment's funding account must be Bank/Credit
-  # Card type; 1345 is Other Current Asset, so crediting it via the BillPayment API
-  # may be rejected — being verified with Natalie (fallback: type 1345 as Bank, or
-  # clear A/P->1345 with a Journal Entry).
+  # do not fuzzy). The QBO Bill Payment uses PayType=CreditCard, so account 1345
+  # must remain a Credit Card-type account in QBO (Natalie's requested setup).
   qbo:
     ap_account_id: "59"                       # Accounts Payable (A/P) 2000 — Bill payable side
     reimbursement_clearing_account_id: "231"  # 1345 Employee Reimbursement Clearing — bill-payment offset

@@ -614,6 +614,145 @@ def test_book_month_groups_by_employee(tmp_path):
     assert "bill_id" not in plan["Keara Mascareñas"]                   # dry-run posts nothing
 
 
+def test_book_month_can_scope_to_export_batch(tmp_path):
+    """A partial export cannot pull another approved reimbursement into its Bill."""
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    selected = _needs_info_row(conn, ext="reimb-selected", employee="Keara Mascareñas",
+                               amount_cents=5000, proposed_coa_line="Telephone & Internet",
+                               status="approved")
+    _needs_info_row(conn, ext="reimb-not-selected", employee="Keara Mascareñas",
+                    amount_cents=4200, proposed_coa_line="Groceries & Meals",
+                    status="approved")
+    res = reimburse_flow.book_month(
+        conn, cfg, "2026-07", post=False, reimb_ids=[selected])
+    assert res["bills"][0]["n_lines"] == 1
+    assert res["bills"][0]["total_cents"] == 5000
+
+
+def test_export_pays_only_after_success_and_uses_justworks_date(tmp_path, monkeypatch):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    rid = _needs_info_row(conn, ext="reimb-export-ok", status="approved")
+    calls = []
+
+    class Rail:
+        name = "justworks_manual"
+        def pay_batch(self, rows, pay_date=None):
+            return {"status": "exported", "rail": self.name, "ref": "JW-1",
+                    "artifact": None, "paste_text": "", "csv_text": ""}
+
+    def fake_book(conn, cfg, month, post=False, bill_date=None, reimb_ids=None):
+        assert reimb_ids == [rid]
+        ledger.set_reimbursement_status(conn, rid, "approved", qbo_bill_id="B-1",
+                                        qbo_vendor_id="V-1")
+        return {"bills": [{"bill_id": "B-1", "problems": [],
+                            "receipts_attached": 1}]}
+
+    monkeypatch.setattr(reimburse_flow, "_qbo_enabled", lambda cfg: True)
+    monkeypatch.setattr(reimburse_flow, "book_month", fake_book)
+    monkeypatch.setattr(reimburse_flow, "_pay_bill", lambda *a, **k: calls.append(k) or {
+        "ok": True, "billpayment_id": "BP-1"})
+    res = reimburse_flow.export_payout(
+        conn, cfg, [rid], Rail(), pay_date="08/15/2026")
+    assert calls == [{"post": True, "txn_date": "2026-08-15"}]
+    assert res["qbo"]["payments"]["paid_bills"] == ["B-1"]
+
+
+def test_failed_export_does_not_pay_qbo_bill(tmp_path, monkeypatch):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    rid = _needs_info_row(conn, ext="reimb-export-failed", status="approved")
+
+    class Rail:
+        name = "justworks_manual"
+        def pay_batch(self, rows, pay_date=None):
+            return {"status": "failed", "rail": self.name, "ref": None,
+                    "artifact": None, "paste_text": ""}
+
+    def fake_book(conn, cfg, month, post=False, bill_date=None, reimb_ids=None):
+        ledger.set_reimbursement_status(conn, rid, "approved", qbo_bill_id="B-2",
+                                        qbo_vendor_id="V-1")
+        return {"bills": [{"bill_id": "B-2", "problems": [],
+                            "receipts_attached": 0}]}
+
+    monkeypatch.setattr(reimburse_flow, "_qbo_enabled", lambda cfg: True)
+    monkeypatch.setattr(reimburse_flow, "book_month", fake_book)
+    monkeypatch.setattr(reimburse_flow, "_pay_bill", lambda *a, **k: pytest.fail(
+        "QBO Bill Payment must not be created when the Justworks export fails"))
+    res = reimburse_flow.export_payout(conn, cfg, [rid], Rail())
+    assert res["result"]["status"] == "failed"
+    assert ledger.reimbursement_by_id(conn, rid)["status"] == "approved"
+
+
+def test_bill_line_marks_billable_customer():
+    """A grouped Bill line carries CustomerRef + BillableStatus when the
+    reimbursement resolved to a QBO customer (so it flows to the client invoice);
+    a plain line has neither."""
+    from cfo_agent.adapters.books_out import qbo_writer
+    b = qbo_writer.bill_body_lines("128", [
+        {"gl_id": "219", "amount_cents": 53012, "description": "Hotel — Link Logistics",
+         "customer_id": "806"},
+        {"gl_id": "175", "amount_cents": 5000, "description": "Home Internet"},
+    ], "2026-07-31", ap_account_id="59")
+    billable, plain = b["Line"]
+    assert billable["AccountBasedExpenseLineDetail"]["BillableStatus"] == "Billable"
+    assert billable["AccountBasedExpenseLineDetail"]["CustomerRef"]["value"] == "806"
+    assert "CustomerRef" not in plain["AccountBasedExpenseLineDetail"]
+    assert "BillableStatus" not in plain["AccountBasedExpenseLineDetail"]
+
+
+def test_attach_receipt_targets_bill(monkeypatch, tmp_path):
+    """attach_receipt links the file to a Bill (not a Purchase) when asked — so a
+    reimbursement's receipt shows on its Bill."""
+    from cfo_agent.adapters.books_out import qbo_writer
+    f = tmp_path / "r.pdf"; f.write_bytes(b"%PDF-1.4 test")
+    sent = {}
+
+    class _Q:
+        _access_token = "t"; base = "https://x"; realm_id = "1"
+        def _refresh_access_token(self): pass
+
+    class _Resp:
+        status_code = 200
+        def json(self): return {"AttachableResponse": [{"Attachable": {"Id": "99"}}]}
+
+    def _post(url, headers=None, files=None, timeout=None):
+        # the JSON metadata part is files[0][1][1]
+        import json as _j
+        sent.update(_j.loads(files[0][1][1]))
+        return _Resp()
+    monkeypatch.setattr(qbo_writer.httpx, "post", _post)
+    aid = qbo_writer.attach_receipt(_Q(), "42332", f, filename="erica-internet",
+                                    entity_type="Bill")
+    assert aid == "99"
+    assert sent["AttachableRef"][0]["EntityRef"]["type"] == "Bill"
+    assert sent["AttachableRef"][0]["EntityRef"]["value"] == "42332"
+
+
+def test_file_id_from_link_shapes():
+    from cfo_agent.engine import gdrive
+    assert gdrive.file_id_from_link(
+        "https://drive.google.com/file/d/ABC123_xyz/view?usp=sharing") == "ABC123_xyz"
+    assert gdrive.file_id_from_link("drive:XYZ789") == "XYZ789"
+    assert gdrive.file_id_from_link("https://x/open?id=QQ11ww22") == "QQ11ww22"
+    assert gdrive.file_id_from_link("/Users/e/receipts/2026-07/x.pdf") is None
+    assert gdrive.file_id_from_link("") is None
+
+
+def test_book_month_flags_billable_without_project(tmp_path):
+    """A billable-category reimbursement with no project can't be billed to a
+    client — book_month flags it (not silently drops it) so the reviewer sets it.
+    Mirrors Mike's July 'Link Logistics' rows (billable category, no project)."""
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg = load_client(CLIENT)
+    _needs_info_row(conn, ext="reimb-M1", employee="Mike Arauz", amount_cents=53012,
+                    proposed_coa_line="Billable Expense", status="approved", project=None)
+    res = reimburse_flow.book_month(conn, cfg, "2026-07", post=False)   # dry-run
+    prob = " ".join(res["bills"][0]["problems"])
+    assert "billable" in prob and "no client/project" in prob
+
+
 def test_bill_reimbursement_flags_missing_category(tmp_path):
     # No category -> flagged before any QBO call (safe, offline).
     conn = ledger.open_db(tmp_path / "l.sqlite3")
