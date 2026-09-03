@@ -44,6 +44,29 @@ def merchant_match(a_norm: str, b_norm: str) -> bool:
     return bool(_tokens(a_norm) & _tokens(b_norm))
 
 
+def refunded_totals(conn, client: str) -> dict:
+    """{charge_external_id: cents already refunded against it} across all linked
+    credits (full or partial)."""
+    totals = {}
+    for r in ledger.refund_links(conn, client):
+        c = ledger.line_by_external_id(conn, client, r["credit_external_id"])
+        if c:
+            totals[r["charge_external_id"]] = (totals.get(r["charge_external_id"], 0)
+                                               + abs(int(c["amount_cents"])))
+    return totals
+
+
+def fully_refunded(conn, client: str) -> set:
+    """Charges that are refunded in full — by one credit or by several partials
+    that add up (Alexis's $775.80 Southwest fare came back as $370.40 + $405.40)."""
+    out = set(ledger.charges_refunded(conn, client))
+    for ext, total in refunded_totals(conn, client).items():
+        ch = ledger.line_by_external_id(conn, client, ext)
+        if ch and total >= abs(int(ch["amount_cents"])):
+            out.add(ext)
+    return out
+
+
 def find_original(conn, client: str, credit: dict, exclude=frozenset()):
     """The charge a credit reverses. `credit` is a ledger-line dict (negative
     amount_cents). Returns (line, 'full') on an exact-amount match (most recent
@@ -56,7 +79,7 @@ def find_original(conn, client: str, credit: dict, exclude=frozenset()):
     d = date.fromisoformat(credit["txn_date"])
     since = (d - timedelta(days=FULL_WINDOW_DAYS)).isoformat()
     cands = ledger.refund_candidates(conn, client, credit["cardholder"], since, credit["txn_date"])
-    taken = ledger.charges_refunded(conn, client) | set(exclude)
+    taken = fully_refunded(conn, client) | set(exclude)
     others = [c for c in cands if c["external_id"] != credit.get("external_id")]
     if not (credit.get("merchant_norm") or "").strip():
         # No descriptor on the credit (it happens on bank-fed reversals): pair on
@@ -70,7 +93,7 @@ def find_original(conn, client: str, credit: dict, exclude=frozenset()):
         return full[0], "full"                 # ORDER BY txn_date DESC -> most recent
     psince = (d - timedelta(days=PARTIAL_WINDOW_DAYS)).isoformat()
     partial = [c for c in same if c["amount_cents"] > amt and c["txn_date"] >= psince
-               and c["status"] != "excluded"]
+               and c["status"] != "excluded" and c["external_id"] not in taken]
     if len(partial) == 1:
         return partial[0], "partial"
     return None, None
@@ -116,10 +139,15 @@ def link(conn, cfg, q, credit: dict, credit_purchase, original: dict, kind: str,
            f"({_merchant(original['merchant_raw'])} {original['txn_date']})")
     ledger.set_proposal(conn, credit["id"], coa, "rule", "high", why,
                         billable=original.get("billable"), status="excluded")
-    if kind == "full" and original.get("status") != "excluded":
+    # Fully refunded = one matching credit, OR several partials that now add up.
+    refunded = refunded_totals(conn, client).get(original["external_id"], 0)
+    completed = kind == "full" or refunded >= abs(int(original["amount_cents"]))
+    if completed and original.get("status") != "excluded":
         ledger.set_status(conn, original["id"], "excluded")
         base = (original.get("rationale") or "").strip()
         suffix = f"refunded {credit['txn_date'][5:]} (credit {credit['external_id']})"
+        if kind != "full":
+            suffix = f"refunded in full by {credit['txn_date'][5:]} (partial credits)"
         ledger.set_rationale(conn, original["id"], f"{base} — {suffix}" if base else suffix)
         ledger.record_decision(conn, client, original["close_month"], original["external_id"],
                                "status", {"status": "excluded", "reason": "refunded",
@@ -140,11 +168,11 @@ def link(conn, cfg, q, credit: dict, credit_purchase, original: dict, kind: str,
         log(f"[refund] no GL to mirror for {credit['external_id']} (original "
             f"{original['external_id']} has no category) — flagged for reviewer")
     return {"kind": kind, "gl": gl, "customer": cust, "booked": booked,
-            "original": original["external_id"]}
+            "original": original["external_id"], "completed": completed}
 
 
 def note_for(credit: dict, original: dict = None, kind: str = None,
-             coa: str = None) -> str:
+             coa: str = None, completed: bool = False) -> str:
     """The one-line FYI for the pal's drip DM."""
     merch = _merchant(credit["merchant_raw"])
     when = credit["txn_date"][5:]
@@ -158,6 +186,9 @@ def note_for(credit: dict, original: dict = None, kind: str = None,
     od = original["txn_date"][5:]
     if kind == "full":
         return f"↩️ {merch} {amt} refunded {when} — cancels your {od} charge, nothing needed."
+    if completed:
+        return (f"↩️ {merch} -{amt} refunded {when} — together with the earlier credit that "
+                f"fully refunds your {od} {_money(original['amount_cents'])} charge, nothing needed.")
     still = ""
     if (original in receipt_needed([original])
             and original.get("receipt_status") not in _HAVE_RECEIPT):
@@ -179,7 +210,9 @@ def backfill(conn, cfg, q, month: str, post: bool = False, log=print) -> dict:
     mapping = qbo_writer.load_mapping(cfg.client)
     out = {"month": month, "credits": 0, "linked": [], "unmatched": [], "skipped": [],
            "notes": defaultdict(list)}
-    for p in qbo_writer.fetch_month(q, month):
+    tally, preview_taken = {}, set()          # dry-run bookkeeping only
+    purchases = sorted(qbo_writer.fetch_month(q, month), key=lambda p: p.get("TxnDate", ""))
+    for p in purchases:
         if not p.get("Credit"):
             continue
         out["credits"] += 1
@@ -193,22 +226,30 @@ def backfill(conn, cfg, q, month: str, post: bool = False, log=print) -> dict:
             continue
         cents = -abs(int(line["amount_cents"]))
         probe = dict(line, amount_cents=cents)
-        orig, kind = find_original(conn, cfg.client, probe)
+        orig, kind = find_original(conn, cfg.client, probe, exclude=preview_taken)
         who = line.get("cardholder") or "?"
         desc = f"{line['txn_date']} {_merchant(line['merchant_raw'])} {_money(cents)} ({who})"
         if not post:
+            done = False
             if orig:
-                out["linked"].append((ext, kind, orig["external_id"], desc))
+                # Preview the running tally so two partials that add up show as full.
+                tally.setdefault(orig["external_id"], 0)
+                tally[orig["external_id"]] += abs(cents)
+                done = kind == "full" or tally[orig["external_id"]] >= abs(int(orig["amount_cents"]))
+                out["linked"].append((ext, "full" if done else kind, orig["external_id"], desc))
+                preview_taken.add(orig["external_id"]) if done else None
             else:
                 out["unmatched"].append((ext, desc))
-            out["notes"][who].append(note_for(probe, orig, kind, line.get("proposed_coa_line")))
+            out["notes"][who].append(note_for(probe, orig, kind, line.get("proposed_coa_line"),
+                                              completed=done and kind != "full"))
             continue
         ledger.set_amount(conn, line["id"], cents)
         fresh = ledger.line_by_external_id(conn, cfg.client, ext)
         if orig:
             res = link(conn, cfg, q, fresh, p, orig, kind, mapping, source="backfill", log=log)
-            out["linked"].append((ext, kind, orig["external_id"], desc))
-            out["notes"][who].append(note_for(fresh, orig, kind))
+            out["linked"].append((ext, "full" if res["completed"] else kind,
+                                  orig["external_id"], desc))
+            out["notes"][who].append(note_for(fresh, orig, kind, completed=res["completed"]))
         else:
             if fresh["status"] not in ("excluded", "approved", "posted"):
                 ledger.set_status(conn, fresh["id"], "flagged")

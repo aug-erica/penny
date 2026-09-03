@@ -171,7 +171,8 @@ def run_once(conn, cfg, penny, month: str, post: bool = True, log=print) -> dict
                 new_by_pal[who] = [l for l in new_by_pal[who]
                                    if l["external_id"] != orig["external_id"]]
             else:
-                notes_by_pal[who].append(refunds.note_for(fresh, orig, kind))
+                notes_by_pal[who].append(
+                    refunds.note_for(fresh, orig, kind, completed=res.get("completed")))
         else:
             prop = _categorize(conn, cfg, line, learned)
             if prop:

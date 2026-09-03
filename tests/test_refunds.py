@@ -253,3 +253,48 @@ def test_find_original_blank_descriptor_pairs_only_when_unique(tmp_path, monkeyp
                               "merchant_raw": "LYFT", "merchant_norm": "LYFT", "amount_cents": 41296,
                               "source": "card_feed", "cardholder": "Alexis Black", "status": "draft"})
     assert refunds.find_original(conn, CLIENT, blank) == (None, None)
+
+
+def test_two_partials_that_add_up_are_a_full_refund(env):
+    # Alexis, Aug 2026: $775.80 Southwest fare refunded as $370.40 (08-13) + $405.40 (08-19).
+    conn, cfg, ops, state, penny = env
+    state["pending"] = [_purchase(1, 775.80, "2026-08-10", "SOUTHWES XXXXXXXXX7287")]
+    cc.run_once(conn, cfg, penny, "2026-08")
+    state["pending"].append(_purchase(2, 370.40, "2026-08-13", "SOUTHWES XXXXXXXXX7287", credit=True))
+    cc.run_once(conn, cfg, penny, "2026-08")
+    assert _line(conn, "qbo-1")["status"] == "draft"                 # half back: still live
+    assert "partial refund" in penny.dms[1][1]
+    state["pending"].append(_purchase(3, 405.40, "2026-08-19", "SOUTHWES XXXXXXXXX4196", credit=True))
+    cc.run_once(conn, cfg, penny, "2026-08")
+    charge = _line(conn, "qbo-1")
+    assert charge["status"] == "excluded" and "refunded in full" in charge["rationale"]
+    assert receipts.receipt_needed(_alexis(conn)) == []               # receipt ask is gone
+    assert "fully refunds your 08-10 $775.80 charge" in penny.dms[2][1]
+    assert {op["gl_id"] for op in ops} == {GT_GL}                      # all three coded alike
+    # a later same-amount credit can't pair to the now fully-refunded charge
+    assert refunds.find_original(conn, CLIENT, {"external_id": "qbo-9", "amount_cents": -77580,
+                                                "txn_date": "2026-08-25", "merchant_norm": "SOUTHWES",
+                                                "cardholder": "Alexis Black"}) == (None, None)
+
+
+def test_backfill_dry_run_shows_summed_partials_as_full(env):
+    conn, cfg, ops, state, penny = env
+    ps = [_purchase(1, 775.80, "2026-08-10", "SOUTHWES XXXXXXXXX7287", gl=GT_GL),
+          _purchase(2, 370.40, "2026-08-13", "SOUTHWES XXXXXXXXX7287", credit=True, gl=GT_GL),
+          _purchase(3, 405.40, "2026-08-19", "SOUTHWES XXXXXXXXX4196", credit=True, gl=GT_GL)]
+    for p in ps:
+        ledger.upsert_line(conn, {"external_id": f"qbo-{p['Id']}", "client": CLIENT, "entity": "e",
+                                  "close_month": "2026-08", "txn_date": p["TxnDate"],
+                                  "merchant_raw": p["Line"][0]["Description"], "merchant_norm": "SOUTHWES",
+                                  "amount_cents": round(p["TotalAmt"] * 100), "source": "card_feed",
+                                  "cardholder": "Alexis Black", "status": "draft"})
+    mp = pytest.MonkeyPatch(); mp.setattr(qbo_writer, "fetch_month", lambda q, m: ps)
+    try:
+        dry = refunds.backfill(conn, cfg, _FakeQ(ps), "2026-08", post=False)
+        assert [k for _, k, _, _ in dry["linked"]] == ["partial", "full"]
+        assert _line(conn, "qbo-1")["status"] == "draft"              # dry run wrote nothing
+        res = refunds.backfill(conn, cfg, _FakeQ(ps), "2026-08", post=True)
+    finally:
+        mp.undo()
+    assert _line(conn, "qbo-1")["status"] == "excluded"
+    assert receipts.receipt_needed(_alexis(conn)) == []
