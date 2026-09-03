@@ -456,6 +456,65 @@ def cmd_penny_poll(args):
     return 0
 
 
+def cmd_penny_refunds(args):
+    """Backfill refund recognition for a month: credits the poller ingested as
+    positive charges are flipped, paired with their charge, and re-coded in QBO.
+    Dry-run unless --post; --notify also DMs each pal their FYI line(s)."""
+    from .adapters.card_feed.qbo_feed import QBOFeed
+    from .adapters.slack_client import PennySlack
+    from .engine import continuous_close, refunds
+    cfg = load_client(args.client)
+    conn = ledger.open_db(RUNS_LOCAL / cfg.client / "ledger.sqlite3")
+    q = QBOFeed(realm_id="")
+    q._refresh_access_token()
+    res = refunds.backfill(conn, cfg, q, args.month, post=args.post)
+    mode = "APPLIED" if args.post else "DRY-RUN"
+    print(f"{res['month']}: {res['credits']} credit(s) in QBO — {mode}")
+    for ext, kind, orig, desc in res["linked"]:
+        print(f"  ↩️ {kind:7s} {desc}  ->  {orig}   [{ext}]")
+    for ext, desc in res["unmatched"]:
+        print(f"  ?  unmatched {desc}   [{ext}]")
+    for ext, why in res["skipped"]:
+        print(f"  -  skipped {ext}: {why}")
+    if res["notes"]:
+        print("\nFYI lines per pal" + (" (sent)" if args.notify and args.post else " (not sent)") + ":")
+        for who, notes in res["notes"].items():
+            print(f"  {who}:")
+            for n in notes:
+                print(f"     {n}")
+    if args.notify and args.post and res["notes"]:
+        penny = PennySlack()
+        for who, notes in res["notes"].items():
+            uid = continuous_close._uid_for(cfg, who)
+            if uid:
+                penny.send_dm(uid, continuous_close._compose(who, [], cfg, notes))
+    return 0
+
+
+def cmd_penny_complete(args):
+    """'Your month is complete' notices for a month: DM each clear cardholder
+    (once) and post the team all-clear to #finance (once). Dry-run unless --post."""
+    from .adapters.slack_client import PennySlack
+    from .engine import month_complete
+    cfg = load_client(args.client)
+    conn = ledger.open_db(RUNS_LOCAL / cfg.client / "ledger.sqlite3")
+    penny = PennySlack() if args.post else None
+    res = month_complete.run_once(conn, cfg, penny, args.month, post=args.post)
+    mode = "SENT" if args.post else "DRY-RUN (would send)"
+    print(f"{res['month']}: {res['n_pals']} cardholder(s) with charges — {mode}")
+    for pal in res["pals_notified"]:
+        print(f"  🎉 complete DM -> {pal}")
+    for pal in res["already"]:
+        print(f"  ✓  already notified: {pal}")
+    for pal, n in res["still_open"].items():
+        print(f"  …  {pal}: {n} open")
+    if res["team_posted"]:
+        print("  ✅ team all-clear -> #finance")
+    elif res["team_already"]:
+        print("  ✓  team all-clear already posted")
+    return 0
+
+
 def cmd_penny_catchup(args):
     """Process any DMs Penny missed while offline (safe to re-run)."""
     from .adapters.slack_client import PennySlack
@@ -1133,6 +1192,17 @@ def main(argv=None):
     pp.add_argument("--month", required=True, help="the close month being worked, YYYY-MM")
     pp.add_argument("--post", action="store_true", help="categorize+write+DM (else dry-run)")
     pp.set_defaults(fn=cmd_penny_poll)
+    pr = psub.add_parser("refunds", help="backfill refund recognition for a month")
+    pr.add_argument("--client", required=True)
+    pr.add_argument("--month", required=True, help="close month, YYYY-MM")
+    pr.add_argument("--post", action="store_true", help="apply ledger + QBO changes (else dry-run)")
+    pr.add_argument("--notify", action="store_true", help="with --post: DM pals their FYI line(s)")
+    pr.set_defaults(fn=cmd_penny_refunds)
+    pm = psub.add_parser("complete", help="'your month is complete' notices for a month")
+    pm.add_argument("--client", required=True)
+    pm.add_argument("--month", required=True, help="close month, YYYY-MM")
+    pm.add_argument("--post", action="store_true", help="send DMs + #finance post (else dry-run)")
+    pm.set_defaults(fn=cmd_penny_complete)
 
     db_p = sub.add_parser("db")
     dbsub = db_p.add_subparsers(dest="subcmd", required=True)

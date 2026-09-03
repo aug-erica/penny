@@ -188,8 +188,38 @@ CREATE TABLE IF NOT EXISTS reimbursement_events (
 CREATE INDEX IF NOT EXISTS idx_reimb_events ON reimbursement_events(client, reimb_external_id);
 """
 
-# Full schema = base tables + reimbursement tables (fresh DBs run all of it).
-DDL = DDL + REIMB_DDL
+# Refund links + one-time notices. Kept in their OWN block for the same reason
+# as REIMB_DDL: brand-new objects only (no ALTER on the live ledger_lines), so
+# open_db can CREATE IF NOT EXISTS them on an already-migrated Postgres without
+# fighting the listener/dashboard for a table lock.
+EXTRA_DDL = """
+-- A card CREDIT (refund) paired with the CHARGE it reverses. `kind` is 'full'
+-- when the amounts match (both lines are excluded -- nothing to ask anyone) or
+-- 'partial' (the charge stays live; the credit is just netted against it).
+CREATE TABLE IF NOT EXISTS refunds (
+  client             TEXT NOT NULL,
+  credit_external_id TEXT NOT NULL,
+  charge_external_id TEXT NOT NULL,
+  kind               TEXT NOT NULL CHECK (kind IN ('full','partial')),
+  source             TEXT,
+  linked_at          TEXT NOT NULL,
+  PRIMARY KEY (client, credit_external_id)
+);
+-- One row per one-time outbound notice Penny has sent (e.g. "your August card is
+-- complete" to a pal, or the team-wide all-clear to #finance) -- the idempotency
+-- guard so a 4-hourly poll loop never repeats itself, even across restarts.
+CREATE TABLE IF NOT EXISTS notices (
+  client       TEXT NOT NULL,
+  close_month  TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  sent_at      TEXT NOT NULL,
+  PRIMARY KEY (client, close_month, kind, target)
+);
+"""
+
+# Full schema = base tables + reimbursement + extra tables (fresh DBs run all of it).
+DDL = DDL + REIMB_DDL + EXTRA_DDL
 
 
 def now() -> str:
@@ -289,7 +319,98 @@ def mark_digest_posted(conn, client: str, close_month: str, post_date: str):
     conn.commit()
 
 
+# ---- refunds ---------------------------------------------------------------
+def refund_candidates(conn, client: str, cardholder: str, since: str,
+                      until: str) -> list:
+    """Positive card charges for a cardholder in [since, until] -- the pool a
+    refund credit is matched against. Deliberately INCLUDES excluded lines: a pal
+    who already told Penny "that was refunded" excluded the charge, and the credit
+    still has to link to it when it posts."""
+    return [dict(r) for r in conn.execute(
+        """SELECT * FROM ledger_lines WHERE client=? AND source='card_feed'
+           AND cardholder=? AND amount_cents > 0 AND txn_date >= ? AND txn_date <= ?
+           ORDER BY txn_date DESC, id DESC""", (client, cardholder, since, until))]
+
+
+def add_refund_link(conn, client: str, credit_external_id: str,
+                    charge_external_id: str, kind: str, source: str = "poller"):
+    conn.execute(
+        "INSERT INTO refunds(client, credit_external_id, charge_external_id, kind, "
+        "source, linked_at) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(client, credit_external_id) DO UPDATE SET "
+        "charge_external_id=excluded.charge_external_id, kind=excluded.kind, "
+        "source=excluded.source, linked_at=excluded.linked_at",
+        (client, credit_external_id, charge_external_id, kind, source, now()))
+    conn.commit()
+
+
+def refund_links(conn, client: str) -> list:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM refunds WHERE client=? ORDER BY linked_at", (client,))]
+
+
+def refund_links_for_month(conn, client: str, close_month: str) -> list:
+    """Refund pairs where the credit OR the charge falls in the month, joined to
+    both ledger lines: [{kind, credit: line, charge: line}]."""
+    out = []
+    for r in refund_links(conn, client):
+        credit = line_by_external_id(conn, client, r["credit_external_id"])
+        charge = line_by_external_id(conn, client, r["charge_external_id"])
+        if not (credit and charge):
+            continue
+        if close_month in (credit.get("close_month"), charge.get("close_month")):
+            out.append({"kind": r["kind"], "credit": credit, "charge": charge})
+    return out
+
+
+def charges_refunded(conn, client: str) -> set:
+    """external_ids of charges that already have a FULL refund linked (so a second
+    identical credit can't pair with the same charge)."""
+    return {r["charge_external_id"] for r in conn.execute(
+        "SELECT charge_external_id FROM refunds WHERE client=? AND kind='full'", (client,))}
+
+
+def set_rationale(conn, line_id: int, rationale: str):
+    conn.execute("UPDATE ledger_lines SET rationale=?, updated_at=? WHERE id=?",
+                 (rationale, now(), line_id))
+    conn.commit()
+
+
+def set_amount(conn, line_id: int, amount_cents: int):
+    """Correct a line's signed amount (the refund backfill flips credits that were
+    ingested positive)."""
+    conn.execute("UPDATE ledger_lines SET amount_cents=?, updated_at=? WHERE id=?",
+                 (amount_cents, now(), line_id))
+    conn.commit()
+
+
+# ---- one-time notices --------------------------------------------------------
+def notice_sent(conn, client: str, close_month: str, kind: str, target: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM notices WHERE client=? AND close_month=? AND kind=? AND target=?",
+        (client, close_month, kind, target)).fetchone() is not None
+
+
+def mark_notice_sent(conn, client: str, close_month: str, kind: str, target: str):
+    conn.execute(
+        "INSERT INTO notices(client, close_month, kind, target, sent_at) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(client, close_month, kind, target) DO NOTHING",
+        (client, close_month, kind, target, now()))
+    conn.commit()
+
+
 _SCHEMA_READY = set()   # backends whose schema this process has already ensured
+
+
+def _ensure_extra_tables(conn):
+    """CREATE IF NOT EXISTS the refunds/notices tables on an already-migrated
+    Postgres. New objects take no lock on ledger_lines; a failure here must never
+    take the listener down (the next start retries)."""
+    try:
+        conn.executescript(EXTRA_DDL)
+        conn.commit()
+    except Exception as exc:
+        print(f"⚠  could not ensure refunds/notices tables: {exc}", flush=True)
 
 
 def _ensure_reimb_columns(conn):
@@ -357,6 +478,7 @@ def open_db(path) -> db.Conn:
             if conn.execute("SELECT 1 FROM information_schema.tables WHERE "
                             "table_name='reimbursements'").fetchone():
                 _ensure_reimb_columns(conn)   # additive, idempotent (tiny table)
+                _ensure_extra_tables(conn)    # brand-new objects only; no contention
                 _SCHEMA_READY.add(key)
                 return conn
         except Exception:
@@ -374,7 +496,7 @@ def open_db(path) -> db.Conn:
         except Exception:
             has_base = None
         if has_base:
-            conn.executescript(REIMB_DDL.replace("{PK}", pk))
+            conn.executescript((REIMB_DDL + EXTRA_DDL).replace("{PK}", pk))
             conn.commit()
             _SCHEMA_READY.add(key)
             return conn

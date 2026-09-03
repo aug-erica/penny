@@ -18,6 +18,7 @@ from flask import Flask, Response, g, jsonify, request
 
 from ..config import RUNS_LOCAL, load_client
 from ..engine import kv, ledger, receipts, reimburse_flow, reimburse_policy
+from ..engine import projects as projects_mod
 from ..engine.dm_assemble import BILLABLE_CANDIDATE, _merchant, _money
 
 app = Flask(__name__)
@@ -123,7 +124,7 @@ def update():
         return jsonify(ok=False, error="bad id"), 400
     field, val = d.get("field"), d.get("value")
     conn = _db()
-    row = conn.execute("SELECT external_id, close_month, merchant_norm, project "
+    row = conn.execute("SELECT external_id, close_month, merchant_norm, project, billable "
                        "FROM ledger_lines WHERE id=?", (lid,)).fetchone()
     if not row:
         return jsonify(ok=False, error="no such line"), 404
@@ -143,6 +144,28 @@ def update():
         ledger.record_decision(conn, _client(), row["close_month"], row["external_id"],
                                "billable_project", {"billable": b, "project": proj},
                                decided_by="dashboard", source="dashboard")
+    elif field == "project":
+        # Picking a project from the dropdown = "billable to this project" (the
+        # same decision a pal makes in Slack); clearing it keeps the Bill flag.
+        proj = (val or "").strip() or None
+        b = 1 if proj else row["billable"]
+        ledger.set_billable_project(conn, lid, b, proj)
+        ledger.record_decision(conn, _client(), row["close_month"], row["external_id"],
+                               "billable_project", {"billable": b, "project": proj},
+                               decided_by="dashboard", source="dashboard")
+        if proj and (row["external_id"] or "").startswith("qbo-"):
+            # Mirror the Slack path: push Billable + customer to QBO and move the
+            # charge to Billable Expense (Natalie's rule). Best-effort — the ledger
+            # decision stands even if QBO is unreachable from this service.
+            try:
+                from ..engine import reply_flow
+                cust = reply_flow._rewrite_qbo_billable(load_client(_client()),
+                                                        row["external_id"], proj)
+                if cust:
+                    ledger.set_proposal(conn, lid, "Billable Expense", "reviewer", "high",
+                                        "billable to client -> Billable Expense (dashboard)")
+            except Exception:
+                pass
     else:
         return jsonify(ok=False, error="bad field"), 400
     return jsonify(ok=True)
@@ -178,7 +201,22 @@ def _bill_select(l: dict) -> str:
             f'{opts}</select>')
 
 
-def _row(l: dict, needed_ids: set, coa: list) -> str:
+def _project_select(l: dict, projects: list) -> str:
+    """Dropdown of every project eligible for billable tagging (Jessie/Mike: typing
+    the exact deal name into Slack was the friction). The line's current value is
+    always selectable even if it has since left the eligible list."""
+    cur = (l.get("project") or "").strip()
+    names = list(projects)
+    if cur and cur.lower() not in {n.lower() for n in names}:
+        names = [cur] + names
+    opts = [f'<option value=""{"" if cur else " selected"}>—</option>']
+    opts += [f'<option value="{html.escape(n, quote=True)}"{" selected" if n == cur else ""}>'
+             f'{html.escape(n)}</option>' for n in names]
+    return (f'<select class="edit proj" data-id="{l["id"]}" data-field="project" '
+            f'title="{html.escape(cur, quote=True)}">{"".join(opts)}</select>')
+
+
+def _row(l: dict, needed_ids: set, coa: list, projects: list = ()) -> str:
     rs = l.get("receipt_status")
     receipt = "✓" if rs in _HAVE_RECEIPT else ("needed" if l["id"] in needed_ids else "—")
     cls = []
@@ -195,7 +233,7 @@ def _row(l: dict, needed_ids: set, coa: list) -> str:
             f'<td class="r">{_money(l["amount_cents"])}</td>'
             f'<td>{_coa_select(l, coa)}</td>'
             f'<td class="c">{_bill_select(l)}</td>'
-            f'<td>{html.escape(l.get("project") or "")}'
+            f'<td>{_project_select(l, projects)}'
             + (f'<br><span class="note">📝 {html.escape(l["billable_note"])}</span>'
                if l.get("billable_note") else "")
             + '</td>'
@@ -206,12 +244,29 @@ def _row(l: dict, needed_ids: set, coa: list) -> str:
 
 
 def _pal_open(charges: list) -> int:
-    untagged = [c for c in charges if c.get("proposed_coa_line") in BILLABLE_CANDIDATE
-                and not c.get("project") and c.get("billable") != 0]
-    needed = receipts.receipt_needed(charges)
-    missing = [c for c in needed if c.get("receipt_status") not in _HAVE_RECEIPT]
-    uncat = [c for c in charges if not c.get("proposed_coa_line")]
-    return len(untagged) + len(missing) + len(uncat)
+    """Open items for a pal — the shared predicate (also drives the "your month
+    is complete" notices) lives in engine.month_complete."""
+    from ..engine.month_complete import open_items
+    return open_items(charges)["open"]
+
+
+def _refunded_section(conn, client: str, month: str) -> str:
+    """Refund pairs Penny netted this month (both lines excluded, credit coded like
+    the charge) — shown so the reviewer sees WHY a charge vanished from a pal's list."""
+    pairs = ledger.refund_links_for_month(conn, client, month)
+    if not pairs:
+        return ""
+    rows = []
+    for r in pairs:
+        c, k = r["charge"], r["credit"]
+        rows.append(
+            f'<li>{html.escape(c.get("cardholder") or "")} — '
+            f'{html.escape(_merchant(c["merchant_raw"]))} {_money(c["amount_cents"])} '
+            f'({c["txn_date"][5:]}) ↩️ {r["kind"]} refund {_money(k["amount_cents"])} '
+            f'({k["txn_date"][5:]}) → {html.escape(c.get("proposed_coa_line") or "—")}</li>')
+    return ('<section><h2>↩️ Refunded / netted <span class="sub">'
+            f'{len(pairs)} pair(s) — excluded from everyone\'s list, coded to the same GL'
+            '</span></h2><ul>' + "".join(rows) + '</ul></section>')
 
 
 @app.route("/")
@@ -222,11 +277,19 @@ def index():
     coa = cfg.coa_lines
     conn = _db()
     monthsel = _month_selector(_months_available(conn, client), month, "/")
+    # Negative non-excluded lines are unmatched card credits: shown (they're real
+    # money the reviewer may want to re-code) but they never count as open items.
     lines = [l for l in ledger.lines_for_month(conn, client, month)
-             if l["status"] != "excluded" and l["amount_cents"] > 0]
+             if l["status"] != "excluded" and l["amount_cents"] != 0]
     by_pal = defaultdict(list)
     for l in lines:
         by_pal[l.get("cardholder") or "(unknown)"].append(l)
+    # Every project a billable charge may be tagged to (active list + all HubSpot
+    # billable-stage deals + whatever is already on this month's lines).
+    try:
+        projects = projects_mod.eligible(cfg, month, extra=[l.get("project") for l in lines])
+    except Exception:
+        projects = sorted({l["project"] for l in lines if l.get("project")}, key=str.lower)
 
     total = sum(l["amount_cents"] for l in lines)
     corrections = sum(1 for l in lines if l.get("proposed_by") == "reviewer")
@@ -240,7 +303,7 @@ def index():
         sub = sum(l["amount_cents"] for l in ch)
         chip = ('<span class="chip ok">all set</span>' if openn == 0 else
                 f'<span class="chip open">{openn} open</span>')
-        rows = "".join(_row(l, needed_ids, coa) for l in ch)
+        rows = "".join(_row(l, needed_ids, coa, projects) for l in ch)
         sections.append(
             f'<section><h2>{html.escape(pal)} <span class="sub">{len(ch)} charges · '
             f'{_money(sub)}</span> {chip}</h2>'
@@ -249,6 +312,7 @@ def index():
             '<th>Conf</th><th>By</th></tr></thead>'
             f'<tbody>{rows}</tbody></table></section>')
 
+    sections.append(_refunded_section(conn, client, month))
     return PAGE.format(month=month, monthsel=monthsel, n=len(lines), total=_money(total),
                        corrections=corrections, done=done, npals=len(by_pal),
                        body="".join(sections), gen=ledger.now())
@@ -450,44 +514,110 @@ def reimbursements_mark_paid():
     return jsonify(ok=True, count=len(paid))
 
 
+
+# ---- August brand chrome ----------------------------------------------------
+# Palette + type from the August Brand Reference (07_Marketing/August Brand):
+# Dark Charcoal #1D1E20, Bright Teal #00ADAF, Dark Teal #007578, Very Light Cyan
+# #E9FFFE, Light Gray #EDEDED, Magenta #D94FA1 (attention), Work Sans throughout.
+_BRAND_CSS = """
+:root{--ink:#1D1E20;--mut:#6d7074;--line:#DDDDDD;--bg:#EDEDED;--card:#FFFFFF;
+--teal:#00ADAF;--teal-dark:#007578;--teal-light:#E9FFFE;--mag:#D94FA1;--mag-dark:#790B5A;
+--mag-light:#FBE8F3;--amber:#FBE8F3;--red:#FBE8F3;--grn:#007578;}
+*{box-sizing:border-box}
+body{font-family:'Work Sans',-apple-system,'Segoe UI',Roboto,sans-serif;color:var(--ink);
+margin:0;background:var(--bg);font-size:14px;-webkit-font-smoothing:antialiased}
+header{background:var(--ink);color:#fff;padding:18px 28px 16px;position:sticky;top:0;z-index:5;
+border-bottom:3px solid var(--teal)}
+header .brand{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+header .logo{height:22px;width:auto;display:block;opacity:.95}
+header .divider{width:1px;height:22px;background:rgba(255,255,255,.25)}
+h1{margin:0;font-size:19px;font-weight:500;letter-spacing:.01em;color:#fff}
+h1 .tag{color:var(--teal);font-weight:500}
+h1 .soft{color:rgba(255,255,255,.55);font-weight:400}
+.meta{color:rgba(255,255,255,.7);margin-top:8px;font-size:13px}
+.meta b{color:#fff;font-weight:600}
+.meta a,a.nav{color:var(--teal);text-decoration:none;font-weight:500}
+.meta a:hover,a.nav:hover{text-decoration:underline}
+.monthsel{font:inherit;font-size:13px;padding:3px 8px;border:1px solid rgba(255,255,255,.3);
+border-radius:6px;background:#2A2B2E;color:#fff}
+main{padding:22px 28px;max-width:1200px;margin:0 auto}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:18px;
+overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+h2{font-size:15px;font-weight:500;margin:0;padding:13px 16px;border-bottom:1px solid var(--line);
+display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:inset 3px 0 0 var(--teal)}
+h2 .sub{color:var(--mut);font-weight:400;font-size:13px}
+.chip{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;letter-spacing:.02em}
+.chip.ok{background:var(--teal-light);color:var(--teal-dark)}
+.chip.open{background:var(--mag-light);color:var(--mag-dark)}
+.chip.rej{background:#F3F3F3;color:var(--mut)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:7px 12px;border-bottom:1px solid #F1F1F1;white-space:nowrap}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600}
+td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
+td.c{text-align:center} td.m{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+td.by,.mut{color:var(--mut);font-size:12px}
+.note{color:var(--mut);font-size:12px;font-style:italic}
+select.edit,select.redit{font:inherit;font-size:13px;padding:2px 4px;border:1px solid var(--line);
+border-radius:5px;background:#fff;color:var(--ink);max-width:230px}
+select.redit{max-width:220px} select.bill{max-width:70px} select.proj{max-width:240px}
+select.saving{border-color:var(--mag)} select.saved{border-color:var(--teal);background:var(--teal-light)}
+select.err{border-color:var(--mag-dark);background:var(--mag-light)}
+tr.missing td.rc-needed,.rc-needed{background:var(--mag-light);color:var(--mag-dark);font-weight:600}
+.rc-n\\/a{color:var(--mut)}
+tr.uncat td{background:#FFF7FB}
+tr.reviewed{box-shadow:inset 3px 0 0 var(--teal)}
+tr.rst-needs_info td{background:#FFF7FB}
+.cf-low{color:var(--mag-dark)} .cf-high{color:var(--teal-dark)}
+.polflag{color:var(--mag-dark);font-size:11px;font-weight:600;cursor:help}
+ul{margin:0;padding:10px 16px 14px 32px;color:var(--ink);font-size:13px} li{padding:3px 0}
+.foot{color:var(--mut);font-size:12px;padding:8px 28px 28px;max-width:1200px;margin:0 auto;
+display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.foot .who{color:var(--mut)} .foot .who b{color:var(--ink);font-weight:500}
+button{font:inherit;font-size:13px;font-weight:600;padding:6px 14px;border-radius:8px;cursor:pointer;
+border:1px solid var(--line);background:#fff;color:var(--ink)}
+button:hover{border-color:var(--teal)}
+#approve,button.primary{border-color:var(--teal);background:var(--teal);color:var(--ink)}
+#approve:hover,button.primary:hover{background:#12BFC1}
+#approve{float:right}
+button.rapprove{border-color:var(--teal);background:var(--teal-light);color:var(--teal-dark)}
+button.rreject{border-color:var(--mag);background:var(--mag-light);color:var(--mag-dark)}
+#export{border-color:var(--teal);background:var(--teal);color:var(--ink)}
+#panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
+#paste{width:100%;height:150px;font-family:ui-monospace,Menlo,monospace;font-size:12px;
+border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;display:none}
+#export,#markpaid{margin-right:8px}
+"""
+_FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+          '<link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600&display=swap" '
+          'rel="stylesheet">')
+
+
+def _logo_data_uri() -> str:
+    """The August wordmark (white, for the charcoal header) inlined as a data URI so
+    the dashboard needs no static-file route. Empty string if the asset is missing."""
+    import base64
+    from ..config import CLIENTS_DIR
+    for cand in (CLIENTS_DIR / _client() / "brand" / "august-logo-white.png",
+                 CLIENTS_DIR / "august" / "brand" / "august-logo-white.png"):
+        try:
+            if cand.exists():
+                return "data:image/png;base64," + base64.b64encode(cand.read_bytes()).decode()
+        except Exception:
+            pass
+    return ""
+
+
+def _brand_header(title_html: str, meta_html: str) -> str:
+    logo = _logo_data_uri()
+    img = f'<img class="logo" src="{logo}" alt="August">' if logo else '<b>August</b>'
+    return (f'<div class="brand">{img}<span class="divider"></span><h1>{title_html}</h1></div>'
+            f'<div class="meta">{meta_html}</div>')
+
 REIMB_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Penny — reimbursements {month}</title><style>
-:root{{--ink:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--amber:#fef3c7;--grn:#16a34a;}}
-*{{box-sizing:border-box}}
-body{{font-family:'Work Sans',-apple-system,Segoe UI,Roboto,sans-serif;color:var(--ink);
-margin:0;background:#fafafa;font-size:14px}}
-header{{background:#fff;border-bottom:1px solid var(--line);padding:20px 28px}}
-h1{{margin:0;font-size:20px;font-weight:600}}
-.meta{{color:var(--mut);margin-top:6px;font-size:13px}} .meta b{{color:var(--ink)}}
-.monthsel{{font:inherit;font-size:13px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:#fff}}
-a.nav{{color:#2563eb;text-decoration:none;font-size:13px}}
-main{{padding:20px 28px;max-width:1100px;margin:0 auto}}
-section{{background:#fff;border:1px solid var(--line);border-radius:10px;margin-bottom:18px;overflow:hidden}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;padding:8px 12px;border-bottom:1px solid #f1f1f1}}
-th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);font-weight:600}}
-td.r,th.r{{text-align:right;font-variant-numeric:tabular-nums}} td.c{{text-align:center}}
-.mut{{color:var(--mut)}}
-.chip{{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px}}
-.chip.ok{{background:#dcfce7;color:#166534}} .chip.open{{background:#fef3c7;color:#92400e}}
-.chip.rej{{background:#fee2e2;color:#991b1b}}
-.rc-needed{{color:#92400e;font-weight:600}} .rc-n\\/a{{color:var(--mut)}}
-.polflag{{color:#b45309;font-size:11px;font-weight:600;cursor:help}}
-tr.rst-needs_info td{{background:#fffbeb}}
-button{{font:inherit;font-size:13px;font-weight:600;padding:5px 12px;border-radius:7px;cursor:pointer;border:1px solid var(--line);background:#fff}}
-button.rapprove{{border-color:var(--grn);background:#f0fdf4;color:#166534}}
-button.rreject{{border-color:#dc2626;background:#fef2f2;color:#991b1b}}
-select.redit{{font:inherit;font-size:13px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;max-width:220px}}
-#panel{{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}}
-#paste{{width:100%;height:150px;font-family:ui-monospace,Menlo,monospace;font-size:12px;
-border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;display:none}}
-#export,#markpaid{{margin-right:8px}}
-#export{{border-color:#2563eb;background:#eff6ff;color:#1d4ed8}}
+<title>August · Penny — reimbursements {month}</title>__FONTS__<style>__CSS__
 </style></head><body>
-<header><h1>Penny · reimbursements</h1>
-<div class="meta">Month: {monthsel} · <b>{n}</b> this month · <b>{total}</b> · <b>{n_appr}</b> approved awaiting payout ·
-<b>{n_exp}</b> exported · <a class="nav" href="/?month={month}">← card close</a></div></header>
+<header>__HDR_REIMB__</header>
 <main>
 <div id="panel">
   <button id="export">Prepare Justworks payout ({n_appr} approved) →</button>
@@ -557,50 +687,15 @@ document.getElementById('markpaid').onclick=function(){{
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Penny — {month} close</title><style>
-:root{{--ink:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--amber:#fef3c7;--red:#fee2e2;--grn:#16a34a;}}
-*{{box-sizing:border-box}}
-body{{font-family:'Work Sans',-apple-system,Segoe UI,Roboto,sans-serif;color:var(--ink);
-margin:0;background:#fafafa;font-size:14px}}
-header{{background:#fff;border-bottom:1px solid var(--line);padding:20px 28px;position:sticky;top:0;z-index:5}}
-h1{{margin:0;font-size:20px;font-weight:600}}
-.meta{{color:var(--mut);margin-top:6px;font-size:13px}} .meta b{{color:var(--ink)}}
-.monthsel{{font:inherit;font-size:13px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:#fff}}
-main{{padding:20px 28px;max-width:1200px;margin:0 auto}}
-section{{background:#fff;border:1px solid var(--line);border-radius:10px;margin-bottom:18px;overflow:hidden}}
-h2{{font-size:15px;font-weight:600;margin:0;padding:14px 16px;border-bottom:1px solid var(--line);
-display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
-h2 .sub{{color:var(--mut);font-weight:400;font-size:13px}}
-.chip{{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px}}
-.chip.ok{{background:#dcfce7;color:#166534}} .chip.open{{background:#fef3c7;color:#92400e}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;padding:6px 12px;border-bottom:1px solid #f1f1f1;white-space:nowrap}}
-th{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);font-weight:600}}
-td.r,th.r{{text-align:right;font-variant-numeric:tabular-nums}}
-td.c{{text-align:center}} td.m{{max-width:220px;overflow:hidden;text-overflow:ellipsis}}
-td.by{{color:var(--mut);font-size:12px}}
-.note{{color:var(--mut);font-size:12px;font-style:italic}}
-select.edit{{font:inherit;font-size:13px;padding:2px 4px;border:1px solid var(--line);border-radius:5px;
-background:#fff;max-width:230px}}
-select.bill{{max-width:70px}}
-select.saving{{border-color:#f59e0b}} select.saved{{border-color:var(--grn);background:#f0fdf4}}
-select.err{{border-color:#dc2626;background:#fef2f2}}
-tr.missing td.rc-needed{{background:var(--amber);color:#92400e;font-weight:600}}
-tr.uncat td{{background:var(--red)}}
-tr.reviewed{{box-shadow:inset 3px 0 0 var(--grn)}}
-.cf-low{{color:#b45309}} .cf-high{{color:#166534}}
-.foot{{color:var(--mut);font-size:12px;padding:8px 28px 28px;max-width:1200px;margin:0 auto}}
-#approve{{float:right;font:inherit;font-size:13px;font-weight:600;padding:6px 14px;
-border-radius:8px;border:1px solid var(--grn);background:#f0fdf4;color:#166534;cursor:pointer}}
-#approve:hover{{background:#dcfce7}}
+<title>August · Penny — {month} close</title>__FONTS__<style>__CSS__
 </style></head><body>
 <header><button id="approve" title="Mark every categorized charge approved — they become next month's precedent">✓ Approve month</button>
-<h1>Penny · {month} expense close <span style="color:#6b7280;font-weight:400">— live &amp; editable</span></h1>
-<div class="meta">Month: {monthsel} · <b>{n}</b> charges · <b>{total}</b> · <b>{corrections}</b> reviewer corrections ·
-<b>{done}/{npals}</b> people fully done · <a href="/reimbursements?month={month}" style="color:#2563eb;text-decoration:none">reimbursements →</a> · <span id="status"></span></div></header>
+__HDR_CARD__</header>
 <main>{body}</main>
-<div class="foot">Live from Postgres. Change a Category or Bill dropdown and it saves instantly.
-Green bar = reviewer-set · amber = receipt needed · red = uncategorized. (loaded {gen} UTC)</div>
+<div class="foot"><span>Live from the ledger. Change a Category, Bill, or Project dropdown and it saves instantly
+(picking a project marks the charge billable and pushes the client to QuickBooks).
+Teal bar = reviewer-set · pink = receipt needed / uncategorized. (loaded {gen} UTC)</span>
+<span class="who"><b>August Public Inc</b> · Penny expense close</span></div>
 <script>
 document.addEventListener('change',function(e){{
   var el=e.target; if(!el.classList.contains('edit'))return;
@@ -626,3 +721,21 @@ document.getElementById('approve').onclick=function(){{
 }};
 </script>
 </body></html>"""
+
+
+# Bake the shared brand chrome into both templates once at import (the templates
+# are str.format'ed per request, so the CSS/fonts/header can't carry {} of their own).
+_HDR_CARD = _brand_header(
+    '<span class="tag">Penny</span> · {month} expense close <span class="soft">— live &amp; editable</span>',
+    'Month: {monthsel} · <b>{n}</b> charges · <b>{total}</b> · <b>{corrections}</b> reviewer corrections · '
+    '<b>{done}/{npals}</b> people fully done · <a href="/reimbursements?month={month}">reimbursements →</a> · '
+    '<span id="status"></span>')
+_HDR_REIMB = _brand_header(
+    '<span class="tag">Penny</span> · reimbursements <span class="soft">— {month}</span>',
+    'Month: {monthsel} · <b>{n}</b> this month · <b>{total}</b> · <b>{n_appr}</b> approved awaiting payout · '
+    '<b>{n_exp}</b> exported · <a class="nav" href="/?month={month}">← card close</a>')
+_CSS_ESC = _BRAND_CSS.replace("{", "{{").replace("}", "}}")   # survives str.format
+PAGE = (PAGE.replace("__FONTS__", _FONTS).replace("__CSS__", _CSS_ESC)
+        .replace("__HDR_CARD__", _HDR_CARD))
+REIMB_PAGE = (REIMB_PAGE.replace("__FONTS__", _FONTS).replace("__CSS__", _CSS_ESC)
+              .replace("__HDR_REIMB__", _HDR_REIMB))

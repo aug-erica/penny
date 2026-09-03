@@ -108,15 +108,19 @@ def assemble_dm(pal_first: str, lines: list, projects: list, bot_name: str) -> s
     return "\n".join(out)
 
 
-def confirm_back(pal_first: str, charges: list, bot_name: str, touched=None) -> str:
+def confirm_back(pal_first: str, charges: list, bot_name: str, touched=None,
+                 refunded: list = None) -> str:
     """After interpreting a reply, echo exactly what was recorded so the pal can
     catch a miss (the conservative interpreter under-tags rather than guess).
     `touched` (external_ids changed by this reply) scopes the "recorded" echoes so
     we don't re-list earlier decisions when charges span months; the "still need"
     prompts stay full-state."""
-    charges = [l for l in charges if l["status"] != "excluded" and l["amount_cents"] > 0]
+    # Unmatched credits (negative) stay visible so a recategorization echoes; only
+    # positive charges can generate asks.
+    charges = [l for l in charges if l["status"] != "excluded" and l["amount_cents"] != 0]
     _this = lambda l: touched is None or l["external_id"] in touched
-    candidates = [l for l in charges if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
+    candidates = [l for l in charges if l.get("proposed_coa_line") in BILLABLE_CANDIDATE
+                  and l["amount_cents"] > 0]
     # Any charge tagged billable+project counts (a pal can bill a non-travel item).
     billable = [l for l in charges if l.get("billable") and l.get("project")]
     not_billable = [l for l in candidates if l.get("billable") == 0 and _this(l)]
@@ -136,6 +140,11 @@ def confirm_back(pal_first: str, charges: list, bot_name: str, touched=None) -> 
     need_note = [l for l in billable if not l.get("billable_note")]
 
     out = [f"Thanks {pal_first}! Here's what I recorded — reply if any of it's off:"]
+    if refunded:
+        out.append("\n↩️ *Refunded:*")
+        for l in refunded:
+            out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} — "
+                       "removed from your list; I'll net the credit when it posts.")
     if recategorized:
         out.append("\n✏️ *Recategorized:*")
         for l in recategorized:
@@ -168,4 +177,40 @@ def confirm_back(pal_first: str, charges: list, bot_name: str, touched=None) -> 
             out.append(f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['project']})")
     if not untagged and not missing_receipts and not need_note:
         out.append("\nYou're all set. 🎉 Nothing else needed.")
+    return "\n".join(out)
+
+
+def status_reply(pal_first: str, charges: list, month: str,
+                 open_reimbursements: int = 0) -> str:
+    """Answer "what's outstanding?" — the full-state picture for the pal's card
+    charges (and a count of their reimbursements still in the approval queue)."""
+    from .month_complete import open_items
+    live = [l for l in charges if l["status"] != "excluded" and l["amount_cents"] > 0]
+    st = open_items(live)
+    mo = date.fromisoformat(month + "-01").strftime("%B")
+    out = [f"Here's where you stand, {pal_first} — {st['n']} {mo} card charge(s), "
+           f"{_money(st['total_cents'])}, all in the books."]
+    candidates = [l for l in live if l.get("proposed_coa_line") in BILLABLE_CANDIDATE]
+    untagged = [l for l in candidates
+                if l.get("billable") is None or (l.get("billable") and not l.get("project"))]
+    have = ("stored", "referenced", "received")
+    missing = [l for l in receipt_needed(live) if l.get("receipt_status") not in have]
+    need_note = [l for l in live if l.get("billable") == 1 and l.get("project")
+                 and not l.get("billable_note")]
+    if untagged:
+        out.append("\n❓ *Still need a call on these* — billable to which project, or not?")
+        out += [f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['txn_date'][5:]})"
+                for l in untagged]
+    if missing:
+        out.append("\n📎 *Still need receipts for:*")
+        out += [f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])}" for l in missing]
+    if need_note:
+        out.append("\n📝 *One line for the invoice, please:*")
+        out += [f"   • {_merchant(l['merchant_raw'])} {_money(l['amount_cents'])} ({l['project']})"
+                for l in need_note]
+    if open_reimbursements:
+        out.append(f"\n💸 {open_reimbursements} reimbursement(s) of yours are in the approval "
+                   "queue — nothing needed from you there.")
+    if not (untagged or missing or need_note):
+        out.append("\nNothing outstanding — you're all set. 🎉")
     return "\n".join(out)

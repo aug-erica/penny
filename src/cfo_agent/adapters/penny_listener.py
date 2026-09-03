@@ -23,8 +23,9 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 
 from ..config import RUNS_LOCAL, env, load_client
 from ..engine import continuous_close as cc_mod
-from ..engine import (intent, kv, ledger, penny_catchup, receipts, reimburse_dm,
-                      reimburse_flow, reply_flow)
+from ..engine import month_complete as mc_mod
+from ..engine import (dm_assemble, intent, kv, ledger, penny_catchup, receipts,
+                      reimburse_dm, reimburse_flow, reply_flow)
 from .slack_client import PennySlack
 
 
@@ -244,6 +245,26 @@ def run(client_name: str, month: str):
             ledger.mark_dm_processed(conn, msg_ts, employee)
             return
 
+        # "What's outstanding? Am I up to date?" -> answer with a status summary,
+        # never the reimbursement/card clarifier (Mike, Sep 2026).
+        if employee and not thread_ts and intent.is_status_question(text, bool(file_ids)):
+            conn = ledger.open_db(db_path)
+            if not ledger.claim_dm(conn, msg_ts, employee):
+                return
+            try:
+                month = active_month()
+                charges = reply_flow._pal_charges(conn, cfg.client, month, employee)
+                open_r = len([r for r in ledger.reimbursements_for(
+                    conn, cfg.client, status=("submitted", "needs_info"))
+                    if r.get("employee") == employee])
+                penny.send_dm(uid, dm_assemble.status_reply(employee.split()[0], charges,
+                                                            month, open_r), thread_ts=msg_ts)
+                _log(f"[status] {employee}: answered status question")
+            except Exception:
+                ledger.unclaim_dm(conn, msg_ts)
+                _log(f"[error] status {employee}: {traceback.format_exc()}")
+            return
+
         if can_reimburse:
             conn = ledger.open_db(db_path)
 
@@ -410,9 +431,20 @@ def run(client_name: str, month: str):
                     # new month's poll — that's how the July 29–31 charges got stranded.
                     for mo in (cur_month, prev_month):
                         res = cc_mod.run_once(conn, cfg, penny, mo, post=True, log=_log)
-                        if res.get("new"):
-                            _log(f"[continuous] {mo}: {res['new']} new charge(s) "
+                        if res.get("new") or res.get("credits"):
+                            _log(f"[continuous] {mo}: {res['new']} new charge(s), "
+                                 f"{res.get('credits', 0)} credit(s) "
                                  f"booked + DM'd: {res.get('pals')}")
+                    # "Your month is complete" notices: judge only the PREVIOUS
+                    # month, and only after a few days' grace for late charges.
+                    grace = int((cc.get("complete_notice") or {}).get(
+                        "grace_days", mc_mod.DEFAULT_GRACE_DAYS))
+                    mo = mc_mod.eligible_month(now, grace)
+                    if mo:
+                        r = mc_mod.run_once(conn, cfg, penny, mo, post=True, log=_log)
+                        if r.get("pals_notified") or r.get("team_posted"):
+                            _log(f"[complete] {mo}: DM'd {r['pals_notified']}; "
+                                 f"team all-clear posted: {r['team_posted']}")
                 except Exception:
                     _log(f"[continuous] error: {traceback.format_exc()}")
                 time.sleep(interval)

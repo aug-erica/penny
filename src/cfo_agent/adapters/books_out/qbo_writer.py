@@ -276,9 +276,10 @@ def attach_receipt(q, purchase_id: str, file_path, filename: str = "",
     return aid
 
 
-def fetch_pending(q, month: str = "2026-06") -> list:
-    """Full Purchase objects (need SyncToken + Line) that have a line still coded
-    to Credit Card Pending, for the given close month (YYYY-MM)."""
+def fetch_month(q, month: str) -> list:
+    """Every Purchase dated in the close month (YYYY-MM), whatever it's coded to.
+    Card refunds are Purchases too -- with `Credit: true` and a POSITIVE line
+    amount -- so callers must check `p.get("Credit")` for the sign."""
     y, m = (int(x) for x in month.split("-"))
     m_start, m_end = f"{month}-01", f"{month}-{calendar.monthrange(y, m)[1]:02d}"
     out, start = [], 1
@@ -287,14 +288,22 @@ def fetch_pending(q, month: str = "2026-06") -> list:
                     f"TxnDate <= '{m_end}' STARTPOSITION {start} MAXRESULTS 100")
         if not b:
             break
-        for p in b:
-            if any((ln.get("AccountBasedExpenseLineDetail") or {}).get("AccountRef", {})
-                   .get("value") == PENDING_ID for ln in p.get("Line", [])):
-                out.append(p)
+        out += b
         start += len(b)
         if len(b) < 100:
             break
     return out
+
+
+def is_pending(p: dict) -> bool:
+    return any((ln.get("AccountBasedExpenseLineDetail") or {}).get("AccountRef", {})
+               .get("value") == PENDING_ID for ln in p.get("Line", []))
+
+
+def fetch_pending(q, month: str = "2026-06") -> list:
+    """Full Purchase objects (need SyncToken + Line) that have a line still coded
+    to Credit Card Pending, for the given close month (YYYY-MM)."""
+    return [p for p in fetch_month(q, month) if is_pending(p)]
 
 
 def plan(q, cfg, penny_lines: list, mapping: dict, cardholder_of,

@@ -40,6 +40,7 @@ Active projects they can bill to (use the name VERBATIM, or null if not billable
 Their reply:
 \"\"\"{reply}\"\"\"
 
+If the reply says a charge IS billable but names a project that is not in the list, still output billable=true and put the project name EXACTLY as the reply wrote it (it will be verified separately) — never turn a missing list entry into "not billable".
 Output a decision ONLY for a charge the reply EXPLICITLY speaks to about billing — i.e. it says the charge is billable/not billable, or names a client/project for it. Do NOT infer billability from anything else (a category change, a receipt, a general comment). If the reply is only about categories or receipts and says nothing about billing, return an empty array []. Never invent a project.
 
 Reply with a JSON array only (empty [] if nothing about billing):
@@ -83,6 +84,15 @@ def interpret_reply(client: str, reply: str, charges: List[dict],
             # ambiguous shorthand (several projects equally close) stays dropped.
             from . import disambiguate
             match = disambiguate.fuzzy_one(proj, projects)
+            if not match:
+                # The pal named a real project that just isn't in this month's
+                # active list (a deal in another window). Confirm it against live
+                # HubSpot before accepting — one clear hit — never invent one.
+                from ..adapters.projects import hubspot_client
+                hits = [h["project"] for h in hubspot_client.search_closed_won(proj)
+                        if h.get("project")]
+                match = (hits[0] if len(hits) == 1
+                         else disambiguate.fuzzy_one(proj, hits) if hits else None)
             if not match:
                 continue  # never invent a project
             proj = match

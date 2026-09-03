@@ -32,23 +32,9 @@ def post_if_due(conn, cfg, month: str, penny) -> str:
 
 
 def _pal_status(charges: list) -> dict:
-    charges = [c for c in charges if c["status"] != "excluded" and c["amount_cents"] > 0]
-    # Needs a project call: travel/billable-category, no project yet, and not
-    # already declared not-billable by the pal.
-    untagged = [c for c in charges if c.get("proposed_coa_line") in BILLABLE_CANDIDATE
-                and not c.get("project") and c.get("billable") != 0]
-    needed = receipt_needed(charges)
-    missing_receipts = [c for c in needed if c.get("receipt_status") not in _HAVE_RECEIPT]
-    needs_reviewer = [c for c in charges if not c.get("proposed_coa_line")]
-    # "Responded" = signals ONLY a human reply produces: a recategorization, a
-    # receipt, or an assigned project. (Not billable flags — the LLM sets a
-    # billable_guess of 0/1 during categorization, so those aren't reply signals.)
-    responded = any(c.get("proposed_by") == "reviewer" or c.get("receipt_status")
-                    or c.get("project") for c in charges)
-    open_items = len(untagged) + len(missing_receipts) + len(needs_reviewer)
-    return {"n": len(charges), "responded": responded, "open": open_items,
-            "untagged": len(untagged), "missing_receipts": len(missing_receipts),
-            "needs_reviewer": len(needs_reviewer)}
+    """Per-pal open items — the shared predicate lives in month_complete."""
+    from .month_complete import open_items
+    return open_items(charges)
 
 
 def build_digest(conn, cfg, month: str, day: int = None) -> str:
@@ -78,6 +64,7 @@ def build_digest(conn, cfg, month: str, day: int = None) -> str:
             if s["untagged"]: bits.append(f"{s['untagged']} need a project")
             if s["missing_receipts"]: bits.append(f"{s['missing_receipts']} receipts")
             if s["needs_reviewer"]: bits.append(f"{s['needs_reviewer']} to categorize")
+            if s.get("need_note"): bits.append(f"{s['need_note']} invoice note(s)")
             tag = "" if s["responded"] else " _(no reply yet)_"
             out.append(f"   • *{pal}* — {', '.join(bits)}{tag}")
 

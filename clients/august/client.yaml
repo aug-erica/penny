@@ -70,6 +70,12 @@ continuous_close:
     - "Keara Mascareñas"
     - "Finance / AP Card"
   poll_hours: 4
+  # "Your month is complete" notices. Once the calendar month is over and this
+  # many days have passed (late-posting charges), Penny DMs each cardholder whose
+  # month is fully handled (once), and posts one all-clear to bot.digest_channel
+  # (#finance) when every enrolled cardholder is clear.
+  complete_notice:
+    grace_days: 3
 
 cardholders:
   "8303": "Erica Seldin"          # main account card

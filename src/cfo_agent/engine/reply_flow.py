@@ -20,6 +20,21 @@ _AMOUNT = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+(?:\.\d{2})?)")
 # but "cannot billable" doesn't.
 _NOT_BILLABLE = re.compile(r"(?<![a-z])no[nt][\s\-_]*billable(?![a-z])", re.I)
 
+# "That Southwest charge was refunded" — a refund/reversal the pal knows about
+# (often before the credit posts). The named charge is excluded so its receipt /
+# category asks stop; when the credit lands, refunds.find_original still links it.
+_REFUNDED = re.compile(
+    r"(?<![a-z])(refund(?:ed|s)?|revers(?:ed|al)|charge[\s-]?back|charged back|"
+    r"credited back)(?![a-z])", re.I)
+_NOT_REFUNDED = re.compile(
+    r"(?<![a-z])(not|no|never|wasn'?t|isn'?t|hasn'?t|haven'?t|didn'?t|won'?t)\s+"
+    r"(?:been\s+|get\s+|got\s+|a\s+)?refund", re.I)
+
+
+_COMMON_WORDS = {"every", "other", "about", "there", "their", "which", "these", "those",
+                 "would", "should", "thank", "thanks", "please", "charge", "charges",
+                 "trial", "again", "after", "before", "still", "think", "right"}
+
 
 def _to_cents(s: str) -> int:
     return round(float(s.replace(",", "")) * 100)
@@ -50,12 +65,38 @@ def _recent_months(month):
 
 
 def _pal_charges(conn, client, month, cardholder):
+    """The pal's live card lines: positive charges plus any unmatched credits
+    (negative, informational — never generate asks, but can be recategorized)."""
     out = []
     for mo in _recent_months(month):
         out += [l for l in ledger.lines_for_month(conn, client, mo)
                 if (l.get("cardholder") or "").lower().find(cardholder.lower()) >= 0
-                and l["status"] != "excluded" and l["amount_cents"] > 0]
+                and l["status"] != "excluded" and l["amount_cents"] != 0]
     return out
+
+
+def _refund_targets(text: str, charges: list):
+    """Which charge(s) a 'refunded' reply points at: by an amount in the text,
+    else by a merchant token (5+ chars) appearing in the text. Returns
+    (targets, options) — options non-empty when several merchants could fit."""
+    pos = [c for c in charges if c["amount_cents"] > 0]
+    amounts = {_to_cents(a) for a in _AMOUNT.findall(text)}
+    if amounts:
+        hits = [c for c in pos if c["amount_cents"] in amounts]
+        if hits:
+            return hits, []
+    words = {w for w in re.split(r"[^a-z0-9]+", text.lower()) if len(w) >= 5}
+    hits = []
+    for c in pos:
+        # Merchant tokens that are also everyday words ("EVERY EVER* TRIAL OVER")
+        # would match almost any sentence — skip them.
+        toks = {t for t in re.split(r"[^a-z0-9]+", (c.get("merchant_norm") or "").lower())
+                if len(t) >= 5 and t not in _COMMON_WORDS}
+        if any(t in w or w in t for t in toks for w in words):
+            hits.append(c)
+    if len(hits) == 1:
+        return hits, []
+    return [], hits            # several could fit -> ask which; none -> nothing
 
 
 def process_pal_reply(conn, cfg, cardholder, text, month,
@@ -71,6 +112,11 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     projects = project_lookup.candidates(cfg, month, text)
     result = {"decisions": 0, "recats": 0, "rules": 0, "receipts": 0}
     touched = set()   # external_ids changed by THIS reply (scopes the confirm-back)
+    # Charges the pal NAMED by amount ("UNITED …$134.38 / UNITED …$457.78 … billable
+    # to X"): a billing call in that message applies to THESE, not to everything
+    # still awaiting a project.
+    amounts_in_text = {_to_cents(a) for a in _AMOUNT.findall(text)}
+    named = [c for c in charges if c["amount_cents"] > 0 and c["amount_cents"] in amounts_in_text]
 
     # 1. billable / project
     billable_push = []   # (line, project) marked billable this reply on a qbo-* line
@@ -100,9 +146,9 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     # "I didn't catch a change" on repeat. Only fires when the interpreter caught
     # nothing specific (so "the hotel is not billable" stays precise).
     if _NOT_BILLABLE.search(text) and not decided_billing:
-        awaiting = [c for c in charges
-                    if c.get("billable") is None
-                    and c.get("proposed_coa_line") in dm_assemble.BILLABLE_CANDIDATE]
+        awaiting = named or [c for c in charges
+                             if c["amount_cents"] > 0 and c.get("billable") is None
+                             and c.get("proposed_coa_line") in dm_assemble.BILLABLE_CANDIDATE]
         for c in awaiting:
             ledger.set_billable_project(conn, c["id"], 0, None)
             ledger.record_decision(conn, cfg.client, month, c["external_id"],
@@ -119,11 +165,12 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     # project when the interpreter caught nothing specific — mirrors the
     # not-billable fallback above. Ambiguous project -> ask (project_unresolved).
     result["project_unresolved"] = []
-    if not decided_billing:
-        awaiting_proj = [c for c in charges
-                         if (c.get("billable") == 1 and not c.get("project"))
-                         or (c.get("billable") is None
-                             and c.get("proposed_coa_line") in dm_assemble.BILLABLE_CANDIDATE)]
+    if not decided_billing and not _NOT_BILLABLE.search(text):
+        awaiting_proj = named or [
+            c for c in charges if c["amount_cents"] > 0
+            if (c.get("billable") == 1 and not c.get("project"))
+            or (c.get("billable") is None
+                and c.get("proposed_coa_line") in dm_assemble.BILLABLE_CANDIDATE)]
         if awaiting_proj:
             proj, proj_opts = project_lookup.resolve(cfg, month, text)
             if proj:
@@ -174,6 +221,25 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                 result["customer_unresolved"].append(
                     {"line": line, "project": project, "candidates": [nm for _, nm, _ in cands]})
 
+    # 1b. "that was refunded": exclude the named charge (stops its receipt/category
+    #     asks); the credit, when it posts, links to it via refunds.find_original.
+    result["refunded"] = []
+    result["refund_unresolved"] = []
+    if _REFUNDED.search(text) and not _NOT_REFUNDED.search(text):
+        targets, options = _refund_targets(text, charges)
+        for c in targets:
+            ledger.set_status(conn, c["id"], "excluded")
+            base = (c.get("rationale") or "").strip()
+            note = f"refunded per {cardholder.split()[0]}"
+            ledger.set_rationale(conn, c["id"], f"{base} — {note}" if base else note)
+            ledger.record_decision(conn, cfg.client, c["close_month"], c["external_id"],
+                                   "status", {"status": "excluded", "reason": "refunded"},
+                                   decided_by=cardholder, source="slack")
+            touched.add(c["external_id"])
+            result["refunded"].append(c)
+        if not targets and options:
+            result["refund_unresolved"] = options
+
     # 2. category corrections -> ledger + rules; non-COA names -> ask for clarity
     new_rules = {}
     clarifications = []
@@ -221,7 +287,6 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     result["filed"] = []          # (merchant, amount_cents) linked this reply
     result["unlinked"] = 0
     if slack and file_ids:
-        amounts_in_text = {_to_cents(a) for a in _AMOUNT.findall(text)}
         for fid in file_ids:
             tmp = Path(tempfile.mktemp())
             try:
@@ -242,6 +307,14 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
             if info.get("amount_cents"):
                 amounts.add(info["amount_cents"])
             cand = [c for c in needed if c["amount_cents"] in amounts]
+            # One file, several charges NAMED by amount in the message (an airline
+            # e-ticket covering two tickets, "receipt for $134.38 and $457.78"):
+            # the file documents all of them — link every one, not just the first.
+            multi = ([c for c in needed if c["amount_cents"] in amounts_in_text]
+                     if len(file_ids) == 1 else [])
+            link_all = len(multi) > 1
+            if link_all:
+                cand = multi
             if not cand and info.get("merchant"):
                 from rapidfuzz import fuzz
                 m = info["merchant"].lower()
@@ -265,8 +338,9 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                     # primary one the receipt documents).
                     exact = [c for c in mm if c["amount_cents"] in amounts]
                     cand = exact or [max(mm, key=lambda c: c["amount_cents"])]
-            target = cand[0] if cand else (needed[0] if len(needed) == 1 else None)
-            if target:
+            targets = (cand if link_all
+                       else [cand[0]] if cand else [needed[0]] if len(needed) == 1 else [])
+            for target in targets:
                 dest = receipt_store.store_file(cfg, month, cardholder, target, tmp)
                 ledger.set_receipt_status(conn, target["id"], "stored", str(dest))
                 ledger.record_decision(conn, cfg.client, month, target["external_id"],
@@ -281,7 +355,7 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
                         _attach_receipt_qbo(cfg, target["external_id"], tmp, target)
                     except Exception:
                         pass
-            else:
+            if not targets:
                 fake = {"merchant_raw": "receipt-unmatched", "amount_cents": 0, "txn_date": month}
                 receipt_store.store_file(cfg, month, cardholder, fake, tmp)
                 result["unlinked"] += 1
@@ -292,7 +366,8 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
     #    billable charges awaiting one (Penny asks for these in the confirm-back).
     result["notes"] = 0
     awaiting = [c for c in _pal_charges(conn, cfg.client, month, cardholder)
-                if c.get("billable") == 1 and c.get("project") and not c.get("billable_note")]
+                if c["amount_cents"] > 0 and c.get("billable") == 1 and c.get("project")
+                and not c.get("billable_note")]
     if awaiting:
         awaiting_by_ext = {c["external_id"]: c for c in awaiting}
         for n in reply_parse.interpret_billable_notes(cfg.client, text, awaiting):
@@ -310,7 +385,14 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
 
     fresh = _pal_charges(conn, cfg.client, month, cardholder)
     bot = cfg.raw.get("bot", {}).get("name", "the expense bot")
-    cb = dm_assemble.confirm_back(cardholder.split()[0], fresh, bot, touched=touched)
+    cb = dm_assemble.confirm_back(cardholder.split()[0], fresh, bot, touched=touched,
+                                  refunded=result["refunded"])
+    if result["refund_unresolved"]:
+        qs = ["\n↩️ *Which one was refunded?* A few could fit — reply with the amount:"]
+        qs += [f"   • {dm_assemble._merchant(c['merchant_raw'])} "
+               f"{dm_assemble._money(c['amount_cents'])} ({c['txn_date'][5:]})"
+               for c in result["refund_unresolved"][:6]]
+        cb = cb + "\n" + "\n".join(qs)
     if clarifications:
         qs = ["\n❓ *A couple didn't match our chart of accounts — which should these be?*"]
         for c in clarifications:
@@ -350,11 +432,12 @@ def process_pal_reply(conn, cfg, cardholder, text, month,
 
     made = (result["decisions"] + result["recats"] + result["receipts"]
             + result["clarify"] + result["workbook_link"] + result["notes"]
-            + len(result.get("project_unresolved", [])))
+            + len(result.get("project_unresolved", []))
+            + len(result["refunded"]) + len(result["refund_unresolved"]))
     if made == 0:
         # Be explicit when nothing was applied (reviewer feedback: "is she correcting?").
         cb = ("_(I didn't catch a specific change in that message, so I haven't recorded "
-              "anything yet. Tell me a category, \"not billable\", or attach a receipt for "
+              "anything yet. Tell me a category, \"not billable\", \"refunded\", or attach a receipt for "
               "a charge and I'll update it. For a spreadsheet of corrections, it's easier "
               "to use the review workbook.)_\n\n") + cb
     result["confirm_back"] = cb

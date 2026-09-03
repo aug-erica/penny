@@ -83,3 +83,37 @@ def test_specific_charge_decision_skips_collective_fallback(tmp_path, monkeypatc
     res = reply_flow.process_pal_reply(conn, cfg, "Karina Mangu-Ward",
                                        f"the delta flight is {PPFA}", "2026-07")
     assert res["decisions"] == 1
+
+
+def test_refunded_reply_excludes_named_charge(tmp_path, monkeypatch):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg, ids = _seed(conn, 2)                     # DELTA AIR 0 $1,086.79 / DELTA AIR 1 $1,086.80
+    res = reply_flow.process_pal_reply(conn, cfg, "Karina Mangu-Ward",
+                                       "the $1,086.79 delta flight was refunded", "2026-07")
+    lines = {l["id"]: l for l in ledger.lines_for_month(conn, CLIENT, "2026-07")}
+    assert lines[ids[0]]["status"] == "excluded" and "refunded per Karina" in lines[ids[0]]["rationale"]
+    assert lines[ids[1]]["status"] == "flagged"
+    assert len(res["refunded"]) == 1
+    cb = res["confirm_back"]
+    assert "Refunded" in cb and "DELTA AIR 0" in cb and "didn't catch" not in cb
+    row = conn.execute("SELECT * FROM decisions WHERE field='status'").fetchone()
+    assert row["line_external_id"] == lines[ids[0]]["external_id"]
+
+
+def test_refunded_reply_ambiguous_asks_which(tmp_path, monkeypatch):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg, ids = _seed(conn, 2)
+    res = reply_flow.process_pal_reply(conn, cfg, "Karina Mangu-Ward",
+                                       "the delta flight got refunded", "2026-07")
+    assert res["refunded"] == [] and len(res["refund_unresolved"]) == 2
+    assert "Which one was refunded" in res["confirm_back"]
+    assert all(l["status"] == "flagged" for l in ledger.lines_for_month(conn, CLIENT, "2026-07"))
+
+
+def test_not_refunded_is_a_noop(tmp_path, monkeypatch):
+    conn = ledger.open_db(tmp_path / "l.sqlite3")
+    cfg, ids = _seed(conn, 1)
+    res = reply_flow.process_pal_reply(conn, cfg, "Karina Mangu-Ward",
+                                       "the $1,086.79 delta was not refunded after all", "2026-07")
+    assert res["refunded"] == []
+    assert ledger.lines_for_month(conn, CLIENT, "2026-07")[0]["status"] == "flagged"

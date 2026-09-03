@@ -32,6 +32,28 @@ _CARD_CUES = re.compile(
     r"my card|the card|company card|receipt for the)(?![a-z])", re.I)
 
 
+# "Where do I stand?" — a pal asking for their status, not filing or answering
+# anything. Answered with a summary instead of the reimbursement/card clarifier.
+_STATUS_Q = re.compile(
+    r"(what(?:'s| is| do)\s+(?:still\s+)?(?:outstanding|open|left|missing|needed|"
+    r"(?:you|i)\s+(?:still\s+)?(?:need|owe)))|"
+    r"(anything\s+(?:else\s+)?(?:outstanding|open|missing|left|you need|i owe|needed))|"
+    r"(am\s+i\s+(?:all\s+)?(?:set|good|done|caught up|up to date|current))|"
+    r"(is\s+everything\s+(?:up to date|in|done|set|current))|"
+    r"(do\s+i\s+(?:have|owe)\s+any(?:thing)?\s*(?:outstanding|open|else|missing)?)|"
+    r"(where\s+(?:do\s+)?(?:i|things)\s+stand)|"
+    r"(^\s*status\??\s*$)", re.I)
+
+
+def is_status_question(text: str, has_receipt: bool = False) -> bool:
+    """A pal asking what's outstanding / whether they're up to date. Never when a
+    file is attached (that's a submission), and only for short-ish messages."""
+    t = (text or "").strip()
+    if not t or has_receipt or len(t.split()) > 25:
+        return False
+    return bool(_STATUS_Q.search(t))
+
+
 def has_money(text: str) -> bool:
     return bool(_AMOUNT.search(text or ""))
 
