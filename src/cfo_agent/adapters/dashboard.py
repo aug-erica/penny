@@ -359,7 +359,8 @@ def _reimb_row(r: dict, coa: list, violations: list = None) -> str:
             f'<td>{html.escape(r.get("employee") or "")} {kind}</td>'
             f'<td>{(r.get("expense_date") or "")[5:]}</td>'
             f'<td class="r">{_money(r["amount_cents"])}</td>'
-            f'<td>{html.escape(r.get("business_purpose") or "")}{flag}</td>'
+            f'<td class="pur" title="{html.escape(r.get("business_purpose") or "")}">'
+            f'{html.escape(r.get("business_purpose") or "")}{flag}</td>'
             f'<td>{_reimb_coa_select(r, coa)}</td>'
             f'<td class="c rc-{receipt}">{receipt}</td>'
             f'<td class="c">{actions}</td></tr>')
@@ -542,7 +543,7 @@ h1 .soft{color:rgba(255,255,255,.55);font-weight:400}
 border-radius:6px;background:#2A2B2E;color:#fff}
 main{padding:22px 28px;max-width:1200px;margin:0 auto}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:18px;
-overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+overflow-x:auto;overflow-y:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 h2{font-size:15px;font-weight:500;margin:0;padding:13px 16px;border-bottom:1px solid var(--line);
 display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:inset 3px 0 0 var(--teal)}
 h2 .sub{color:var(--mut);font-weight:400;font-size:13px}
@@ -555,6 +556,7 @@ th,td{text-align:left;padding:7px 12px;border-bottom:1px solid #F1F1F1;white-spa
 th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600}
 td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
 td.c{text-align:center} td.m{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+td.pur{max-width:460px;overflow:hidden;text-overflow:ellipsis}
 td.by,.mut{color:var(--mut);font-size:12px}
 .note{color:var(--mut);font-size:12px;font-style:italic}
 select.edit,select.redit{font:inherit;font-size:13px;padding:2px 4px;border:1px solid var(--line);
