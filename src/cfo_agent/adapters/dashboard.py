@@ -340,6 +340,11 @@ def index():
 
 # --- Reimbursements queue --------------------------------------------------
 
+def _reimb_open(rows: list) -> int:
+    """Reimbursements still waiting on a person — the queue's open count."""
+    return sum(1 for r in rows if r["status"] in ("submitted", "needs_info"))
+
+
 def _reimb_coa_select(r: dict, coa: list) -> str:
     cur = r.get("proposed_coa_line")
     editable = r["status"] in ("submitted", "needs_info")
@@ -374,13 +379,12 @@ def _reimb_row(r: dict, coa: list, violations: list = None) -> str:
         actions = '<span class="chip ok">paid</span>'
     elif st == "rejected":
         actions = f'<span class="chip rej">rejected</span>'
-    kind = "🔁" if r.get("kind") == "stipend" else ""
+    kind = "🔁 " if r.get("kind") == "stipend" else ""
+    purpose = html.escape(r.get("business_purpose") or "")
     return (f'<tr class="rst-{st}">'
-            f'<td>{html.escape(_pal(r.get("employee")))} {kind}</td>'
             f'<td>{(r.get("expense_date") or "")[5:]}</td>'
             f'<td class="r">{_money(r["amount_cents"])}</td>'
-            f'<td class="pur" title="{html.escape(r.get("business_purpose") or "")}">'
-            f'{html.escape(r.get("business_purpose") or "")}{flag}</td>'
+            f'<td class="pur" title="{purpose}">{kind}{purpose}{flag}</td>'
             f'<td>{_reimb_coa_select(r, coa)}</td>'
             f'<td class="c rc-{receipt}">{receipt}</td>'
             f'<td class="c">{actions}</td></tr>')
@@ -403,9 +407,36 @@ def reimbursements_page():
                                       r.get("business_purpose"),
                                       r.get("proposed_coa_line"),
                                       r.get("expense_date"), today)
-    body = "".join(_reimb_row(r, coa, _viol(r)) for r in rows) or (
-        '<tr><td colspan="7" class="mut" style="padding:16px">No reimbursements '
-        'this month yet.</td></tr>')
+    by_emp = defaultdict(list)
+    for r in rows:
+        by_emp[r.get("employee") or "(unknown)"].append(r)
+    # Grouped per person like the close page. Groups with something to review
+    # float to the top (the flat queue used to do this via _REIMB_ORDER); within
+    # a group that same status order still applies.
+    sections = []
+    for emp in sorted(by_emp, key=lambda e: (0 if _reimb_open(by_emp[e]) else 1,
+                                             _pal(e).lower())):
+        rs = sorted(by_emp[emp], key=lambda r: (_REIMB_ORDER.get(r["status"], 9),
+                                                r.get("submitted_at") or ""))
+        openn = _reimb_open(rs)
+        sub = sum(r["amount_cents"] for r in rs)
+        chip = ('<span class="chip ok">all set</span>' if openn == 0 else
+                f'<span class="chip open">{openn} to review</span>')
+        trs = "".join(_reimb_row(r, coa, _viol(r)) for r in rs)
+        sections.append(
+            f'<section><h2>{html.escape(_pal(emp))} <span class="sub">'
+            f'{len(rs)} item(s) · {_money(sub)}</span> {chip}</h2>'
+            '<table class="reimb"><colgroup><col style="width:8%">'
+            '<col style="width:10%"><col style="width:34%">'
+            '<col style="width:23%"><col style="width:9%">'
+            '<col style="width:16%"></colgroup>'
+            '<thead><tr><th>Date</th><th class="r">Amount</th>'
+            '<th>Purpose</th><th>Category</th><th>Receipt</th>'
+            '<th class="c">Action</th></tr></thead>'
+            f'<tbody>{trs}</tbody></table></section>')
+    body = "".join(sections) or (
+        '<section><p class="mut" style="padding:16px;margin:0">No reimbursements '
+        'this month yet.</p></section>')
     n_appr = sum(1 for r in rows if r["status"] == "approved")
     n_exp = sum(1 for r in rows if r["status"] == "exported")
     total = sum(r["amount_cents"] for r in rows if r["status"] not in ("rejected",))
@@ -572,6 +603,7 @@ h2 .sub{color:var(--mut);font-weight:400;font-size:13px}
 .chip.open{background:var(--mag-light);color:var(--mag-dark)}
 .chip.rej{background:#F3F3F3;color:var(--mut)}
 table{width:100%;border-collapse:collapse}
+table.reimb{table-layout:fixed}
 th,td{text-align:left;padding:7px 12px;border-bottom:1px solid #F1F1F1;white-space:nowrap}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);font-weight:600}
 td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
@@ -649,9 +681,7 @@ REIMB_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <textarea id="paste" readonly placeholder="Copy-paste text for Justworks will appear here"></textarea>
   <div id="artifact" class="mut" style="margin-top:6px"></div>
 </div>
-<section><table><thead><tr><th>Employee</th><th>Date</th><th class="r">Amount</th>
-<th>Purpose</th><th>Category</th><th>Receipt</th><th class="c">Action</th></tr></thead>
-<tbody>{body}</tbody></table></section>
+{body}
 </main>
 <script>
 function post(url,data){{return fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},
