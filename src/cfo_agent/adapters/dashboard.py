@@ -385,9 +385,9 @@ def _reimb_row(r: dict, coa: list, violations: list = None) -> str:
             f'<td>{(r.get("expense_date") or "")[5:]}</td>'
             f'<td class="r">{_money(r["amount_cents"])}</td>'
             f'<td class="pur" title="{purpose}">{kind}{purpose}{flag}</td>'
-            f'<td>{_reimb_coa_select(r, coa)}</td>'
+            f'<td class="cat">{_reimb_coa_select(r, coa)}</td>'
             f'<td class="c rc-{receipt}">{receipt}</td>'
-            f'<td class="c">{actions}</td></tr>')
+            f'<td class="c act">{actions}</td></tr>')
 
 
 @app.route("/reimbursements")
@@ -609,6 +609,8 @@ th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)
 td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
 td.c{text-align:center} td.m{max-width:220px;overflow:hidden;text-overflow:ellipsis}
 td.pur{max-width:380px;white-space:normal;overflow-wrap:anywhere}
+td.cat{white-space:normal;overflow-wrap:anywhere}
+td.act{white-space:normal}
 td.by,.mut{color:var(--mut);font-size:12px}
 .note{color:var(--mut);font-size:12px;font-style:italic}
 select.edit,select.redit{font:inherit;font-size:13px;padding:2px 4px;border:1px solid var(--line);
