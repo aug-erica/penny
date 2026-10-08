@@ -13,6 +13,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from flask import Flask, Response, g, jsonify, request
 
@@ -260,13 +261,32 @@ def _refunded_section(conn, client: str, month: str) -> str:
     for r in pairs:
         c, k = r["charge"], r["credit"]
         rows.append(
-            f'<li>{html.escape(c.get("cardholder") or "")} — '
+            f'<li>{html.escape(_pal(c.get("cardholder")))} — '
             f'{html.escape(_merchant(c["merchant_raw"]))} {_money(c["amount_cents"])} '
             f'({c["txn_date"][5:]}) ↩️ {r["kind"]} refund {_money(k["amount_cents"])} '
             f'({k["txn_date"][5:]}) → {html.escape(c.get("proposed_coa_line") or "—")}</li>')
     return ('<section><h2>↩️ Refunded / netted <span class="sub">'
             f'{len(pairs)} pair(s) — excluded from everyone\'s list, coded to the same GL'
             '</span></h2><ul>' + "".join(rows) + '</ul></section>')
+
+
+
+@lru_cache(maxsize=8)
+def _display_names(client: str) -> dict:
+    """client.yaml `display_names`: internal identity -> label to show."""
+    try:
+        return dict(load_client(client).raw.get("display_names") or {})
+    except Exception:
+        return {}
+
+
+def _pal(name) -> str:
+    """How a person's name is PRINTED. Penny's internal identity is unchanged --
+    it stays the key in slack_users / cardholders / justworks_members / the QBO
+    vendor map, and the value stored on every ledger line, reimbursement, journal
+    decision and receipt filename. Renaming that key would orphan all of a
+    person's history, so a corrected or preferred name belongs here instead."""
+    return _display_names(_client()).get(name) or name or ""
 
 
 @app.route("/")
@@ -305,7 +325,7 @@ def index():
                 f'<span class="chip open">{openn} open</span>')
         rows = "".join(_row(l, needed_ids, coa, projects) for l in ch)
         sections.append(
-            f'<section><h2>{html.escape(pal)} <span class="sub">{len(ch)} charges · '
+            f'<section><h2>{html.escape(_pal(pal))} <span class="sub">{len(ch)} charges · '
             f'{_money(sub)}</span> {chip}</h2>'
             '<table><thead><tr><th>Date</th><th>Merchant</th><th class="r">Amount</th>'
             '<th>Category</th><th>Bill</th><th>Project</th><th>Receipt</th>'
@@ -356,7 +376,7 @@ def _reimb_row(r: dict, coa: list, violations: list = None) -> str:
         actions = f'<span class="chip rej">rejected</span>'
     kind = "🔁" if r.get("kind") == "stipend" else ""
     return (f'<tr class="rst-{st}">'
-            f'<td>{html.escape(r.get("employee") or "")} {kind}</td>'
+            f'<td>{html.escape(_pal(r.get("employee")))} {kind}</td>'
             f'<td>{(r.get("expense_date") or "")[5:]}</td>'
             f'<td class="r">{_money(r["amount_cents"])}</td>'
             f'<td class="pur" title="{html.escape(r.get("business_purpose") or "")}">'
