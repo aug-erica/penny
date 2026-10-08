@@ -77,6 +77,15 @@ continuous_close:
   complete_notice:
     grace_days: 3
 
+# Names as the dashboard DISPLAYS them. The key is Penny's internal identity for
+# that person -- it is the key in bot.slack_users, cardholders, justworks_members
+# and the reimbursement QBO vendor map, and the value stored on every ledger line,
+# reimbursement row, journal decision and receipt filename. Changing the key would
+# detach all of that person's history, so a corrected or preferred name goes here
+# and only the rendered label changes.
+display_names:
+  "Alexis Black": "Alexis Gonzales-Black"
+
 cardholders:
   "8303": "Erica Seldin"          # main account card
   "9768": "Alexis Black"
